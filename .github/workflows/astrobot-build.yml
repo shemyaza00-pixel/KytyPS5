@@ -30,8 +30,28 @@ jobs:
           git remote add upstream https://github.com/KytyPS5/KytyPS5.git
           git fetch upstream refs/pull/838/head:pr838
           git fetch upstream a4d26cf81abb38b8fd541482bc66d134ad135c4b
+
           git cherry-pick pr838
+          if ($LASTEXITCODE -ne 0) { throw "Cherry-pick #838 failed" }
+
           git cherry-pick a4d26cf81abb38b8fd541482bc66d134ad135c4b
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "#839 conflicts with the older #780 base. Resolving the known patcher files in favor of #839."
+            git checkout --theirs -- src/loader/guestInstructionPatcher.h
+            git checkout --theirs -- src/loader/redZonePatcher.cpp
+            git checkout --theirs -- src/loader/runtimeLinker.cpp
+            git checkout --theirs -- tests/VirtualMemoryAllocationTests.cpp
+            git add -A
+            git -c core.editor=true cherry-pick --continue
+            if ($LASTEXITCODE -ne 0) { throw "Could not resolve #839 conflicts" }
+          }
+
+          $markers = git grep -n -E '^(<<<<<<<|=======|>>>>>>>)' -- '*.cpp' '*.h' 2>$null
+          if ($LASTEXITCODE -eq 0 -and $markers) {
+            $markers
+            throw "Conflict markers remain after applying fixes"
+          }
+
           git log -5 --oneline
 
       - name: Setup Visual Studio environment
