@@ -30,7 +30,6 @@ jobs:
           git fetch upstream refs/pull/838/head:pr838
           git fetch upstream 8c4224908b758abd91cf3a3f36fbe1be1b2f5e0a
           git fetch upstream refs/pull/985/head:pr985
-          git fetch upstream refs/pull/988/head:pr988
           git fetch upstream e317465d8a773b33482ad367ad2f856154c8bc6d
 
           git cherry-pick pr838
@@ -67,26 +66,9 @@ jobs:
           # The PR #558 DPP patch targets a different emitter architecture, so it is not
           # cherry-picked here. The streamed-mip correction is ported explicitly below.
 
-          # Recompiler disk cache (#988). Use the PR delta, resolving test-only conflicts from
-          # the old #780 base in favour of the PR tests.
-          $commits988 = git rev-list --reverse e317465d8a773b33482ad367ad2f856154c8bc6d..pr988
-          foreach ($commit in $commits988) {
-            git cherry-pick $commit
-            if ($LASTEXITCODE -ne 0) {
-              $unmerged = @(git diff --name-only --diff-filter=U)
-              if ($unmerged.Count -gt 0 -and ($unmerged | Where-Object { $_ -notlike "tests/*" }).Count -eq 0) {
-                foreach ($file in $unmerged) {
-                  git checkout --theirs -- $file
-                  git add $file
-                }
-                git -c core.editor=true cherry-pick --continue
-              }
-              if ($LASTEXITCODE -ne 0) {
-                $unmerged | ForEach-Object { Write-Host "Unresolved #988: $_" }
-                throw "#988 cherry-pick failed at $commit"
-              }
-            }
-          }
+          # #988's current head rewrites pipelineCache.cpp against the newer renderer and
+          # conflicts with the #780 cache architecture. Keep #982 for this V2; #988 can be
+          # ported separately after gameplay/rendering stability is verified.
 
           $markers = git grep -n -E '^(<<<<<<<|=======|>>>>>>>)' -- '*.cpp' '*.h' 2>$null
           if ($LASTEXITCODE -eq 0 -and $markers) {
@@ -739,7 +721,6 @@ jobs:
           Adds official post-base audio timing/AvPlayer fixes (#822, #848, #966).
           Adds #801 WQM/live-predicate correction.
           Adds Astro rendering fixes for DPP helper lanes and streamed mip residency.
-          Adds #988 shader recompiler disk cache.
           Keeps #900 interrupt-only RELEASE_MEM batching and #982 persistent Vulkan cache.
           The previous custom A/V frame-dropping experiment has been removed.
 
