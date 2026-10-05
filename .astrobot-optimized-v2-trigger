@@ -6,3 +6,4 @@ Retry robust streamed-mip patch.
 Retry with rendering and perf ports.
 Retry with clean mip port only.
 Retry with manual depth-target port.
+Retry with manual tail perf ports.
