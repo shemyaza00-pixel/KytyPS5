@@ -1,0 +1,397 @@
+name: Astro Bot next graphics/performance builds
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: tuned988perf
+            base_ref: 44798085bd26fd27078671789f5e8426aeb21521
+          - variant: srt558perf
+            base_ref: f9c1e3faed51b5ed5b6a719673c0cf3cced58281
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout selected graphics base
+        uses: actions/checkout@v4
+        with:
+          repository: KytyPS5/KytyPS5
+          ref: ${{ matrix.base_ref }}
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Configure Git and fetch compatibility patches
+        shell: pwsh
+        run: |
+          git config user.name "AstroBot CI"
+          git config user.email "actions@users.noreply.github.com"
+          git fetch origin refs/pull/838/head:pr838
+          git fetch origin 8c4224908b758abd91cf3a3f36fbe1be1b2f5e0a
+          git fetch origin refs/pull/985/head:pr985
+          git fetch origin e317465d8a773b33482ad367ad2f856154c8bc6d
+          git fetch origin refs/pull/988/head:pr988
+          "# Base: ${{ matrix.base_ref }}" | Set-Content applied-patches.txt
+
+      - name: Apply Windows protected-read fix
+        shell: pwsh
+        run: |
+          git cherry-pick pr838
+          if ($LASTEXITCODE -ne 0) {
+            git cherry-pick --abort 2>$null
+            throw "#838 did not apply to this base"
+          }
+          "#838 protected-read bounce buffer" | Add-Content applied-patches.txt
+
+      - name: Apply Intel EXTRQ compatibility
+        shell: pwsh
+        run: |
+          # Try the redZonePatcher-era revision first. If the base already uses the newer
+          # guestInstructionPatcher architecture, use merged #839 instead.
+          git cherry-pick 8c4224908b758abd91cf3a3f36fbe1be1b2f5e0a
+          if ($LASTEXITCODE -ne 0) {
+            git cherry-pick --abort 2>$null
+            git fetch origin a4d26cf81abb38b8fd541482bc66d134ad135c4b
+            git cherry-pick a4d26cf81abb38b8fd541482bc66d134ad135c4b
+            if ($LASTEXITCODE -ne 0) {
+              git cherry-pick --abort 2>$null
+              throw "Neither compatible nor merged #839 applied"
+            }
+            "#839 merged guest-instruction patcher" | Add-Content applied-patches.txt
+          } else {
+            "#839 compatible red-zone revision" | Add-Content applied-patches.txt
+          }
+
+      - name: Apply #985 wave-wide shader-loop fix where needed
+        shell: pwsh
+        run: |
+          $commits = @(git rev-list --reverse e317465d8a773b33482ad367ad2f856154c8bc6d..pr985)
+          $applied = $true
+          foreach ($commit in $commits) {
+            git cherry-pick $commit
+            $rc = $LASTEXITCODE
+            if ($rc -ne 0) {
+              $unmerged = @(git diff --name-only --diff-filter=U)
+              $prod = @($unmerged | Where-Object { $_ -notlike "tests/*" })
+              if ($unmerged.Count -gt 0 -and $prod.Count -eq 0) {
+                foreach ($file in $unmerged) {
+                  git checkout --theirs -- $file
+                  git add $file
+                }
+                git -c core.editor=true cherry-pick --continue
+                $rc = $LASTEXITCODE
+              }
+            }
+            if ($rc -ne 0) {
+              git cherry-pick --abort 2>$null
+              $applied = $false
+              break
+            }
+          }
+          if ($applied) {
+            "#985 wave-wide zero-branch fix" | Add-Content applied-patches.txt
+          } else {
+            "NOTE: #985 skipped on this base because production code diverged" | Add-Content applied-patches.txt
+          }
+
+      - name: Port RELEASE_MEM batching
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          p=Path("src/graphics/guest_gpu/command_processor/pm4Handlers.cpp")
+          s=p.read_text(encoding="utf-8")
+          def once(old,new,label):
+              global s
+              if old not in s: raise RuntimeError(label)
+              s=s.replace(old,new,1)
+          if "DeferInterruptOnlyReleaseMemFlushes" not in s:
+              once("#include <cstdio>\n#include <cstring>",
+                   "#include <cstdio>\n#include <cstdlib>\n#include <cstring>","include")
+              once("namespace {\n\nconstexpr uint32_t GcrGl2MetadataInvalidate",
+          """namespace {
+
+          bool DeferInterruptOnlyReleaseMemFlushes() {
+              static const bool enabled = [] {
+                  const auto* value = std::getenv("KYTY_DEFER_RELEASE_MEM_INTERRUPTS");
+                  return value != nullptr && value[0] != '\\0' && std::strcmp(value, "0") != 0;
+              }();
+              return enabled;
+          }
+
+          constexpr uint32_t GcrGl2MetadataInvalidate""","helper")
+              once("""\t\t\tcase 0x01:
+          \t\t\tcase 0x02:
+          \t\t\tcase 0x04:
+          \t\t\t\tcp.TriggerEopEventAtEndOfPipe(interrupt_context_id);
+          \t\t\t\tcp.BufferFlush();
+          \t\t\t\tbreak;""",
+          """\t\t\tcase 0x01:
+          \t\t\tcase 0x02:
+          \t\t\tcase 0x04:
+          \t\t\t\tcp.TriggerEopEventAtEndOfPipe(interrupt_context_id);
+          \t\t\t\tif (!DeferInterruptOnlyReleaseMemFlushes()) {
+          \t\t\t\t\tcp.BufferFlush();
+          \t\t\t\t}
+          \t\t\t\tbreak;""","release_mem")
+              p.write_text(s,encoding="utf-8")
+          '@ | Set-Content -Encoding UTF8 port900.py
+          python port900.py
+          if ($LASTEXITCODE -ne 0) { throw "#900 runtime port failed" }
+          Remove-Item port900.py
+          "#900 runtime RELEASE_MEM batching" | Add-Content applied-patches.txt
+
+      - name: Add on-disk recompiler cache #988 when compatible
+        shell: pwsh
+        run: |
+          $commit = (git rev-list --reverse e317465d8a773b33482ad367ad2f856154c8bc6d..pr988 | Select-Object -Last 1)
+          git cherry-pick $commit
+          $rc = $LASTEXITCODE
+          if ($rc -ne 0) {
+            $unmerged = @(git diff --name-only --diff-filter=U)
+            # New cache files/CMake/version generation are safe; pipelineCache.cpp may need a
+            # later manual port. Do not hide any other production conflict.
+            $allowed = @(
+              "src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp",
+              "tests/ShaderDiskCacheTests.cpp"
+            )
+            $bad = @($unmerged | Where-Object { $_ -notin $allowed })
+            if ($unmerged.Count -gt 0 -and $bad.Count -eq 0) {
+              foreach ($file in $unmerged) {
+                if ($file -eq "src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp") {
+                  git checkout --ours -- $file
+                } else {
+                  git checkout --theirs -- $file
+                }
+                git add $file
+              }
+              git -c core.editor=true cherry-pick --continue
+              $rc = $LASTEXITCODE
+            }
+          }
+          if ($rc -ne 0) {
+            git cherry-pick --abort 2>$null
+            "NOTE: #988 skipped; incompatible production conflict" | Add-Content applied-patches.txt
+          } else {
+            "#988 shader recompiler disk-cache core" | Add-Content applied-patches.txt
+          }
+
+      - name: Port persistent Vulkan pipeline cache #982 semantics
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          p=Path("src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp")
+          s=p.read_text(encoding="utf-8")
+          if "kPipelineCacheFormat" not in s and "DriverCacheSignature" in s:
+              anchor="std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {"
+              if anchor in s:
+                  s=s.replace(anchor,"""constexpr uint32_t kPipelineCacheFormat = 2;
+
+          std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {""",1)
+              old='return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\\n", KYTY_GIT_REVISION,'
+              if old in s:
+                  s=s.replace(old,'return fmt::format("KytyPC2:{}:{:08x}:{:08x}:{:08x}:{}\\n", kPipelineCacheFormat,',1)
+              start=s.find("\tconst std::string_view git_hash     = KYTY_GIT_HASH;")
+              if start>=0:
+                  end=s.find("\n\tconst auto properties",start)
+                  if end>=0: s=s[:start]+s[end+1:]
+              s=s.replace("driver, emulator, or data mismatch","driver, format, or data mismatch")
+              p.write_text(s,encoding="utf-8")
+          '@ | Set-Content -Encoding UTF8 port982.py
+          python port982.py
+          if ($LASTEXITCODE -ne 0) { throw "#982 semantics port failed" }
+          Remove-Item port982.py
+          "#982 persistent Vulkan pipeline cache semantics" | Add-Content applied-patches.txt
+
+      - name: Apply low-risk renderer CPU optimizations
+        shell: pwsh
+        run: |
+          $patches = @(
+            "64eea6b32d52bdd27075d0b5dec2f2152cebf893",
+            "b86cf0a8c26294bd001946dca314f53254c65002",
+            "2b2915e200420249519159ac79d759634fa34cf7",
+            "71017416bcbb8bbbe7d795c1f5ece5c41d4c0a13",
+            "a67a033f959bb338add618f7eee240fe40e6f5a7",
+            "a9620f989a1b6efda5d183823fc88f4313c29d54",
+            "8fa116eeb157964ea3b7aec1eed4d6e9d87e11de",
+            "0bb2bdad17f69c3adc50934da88319826ae6adf5"
+          )
+          foreach ($commit in $patches) {
+            git fetch origin $commit
+            git cherry-pick $commit
+            $rc = $LASTEXITCODE
+            if ($rc -ne 0) {
+              $unmerged = @(git diff --name-only --diff-filter=U)
+              $prod = @($unmerged | Where-Object { $_ -notlike "tests/*" })
+              if ($unmerged.Count -gt 0 -and $prod.Count -eq 0) {
+                foreach ($file in $unmerged) {
+                  git checkout --theirs -- $file
+                  git add $file
+                }
+                git -c core.editor=true cherry-pick --continue
+                $rc=$LASTEXITCODE
+              }
+            }
+            if ($rc -eq 0) {
+              "$commit applied" | Add-Content applied-patches.txt
+            } else {
+              git cherry-pick --abort 2>$null
+              "$commit skipped (production conflict)" | Add-Content applied-patches.txt
+            }
+          }
+
+      - name: Remove inactive profiler hot-path scopes
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          p=Path("src/common/profiler.h")
+          if p.exists():
+              s=p.read_text(encoding="utf-8")
+              start=s.find("#define KYTY_PROFILER_BLOCK(name, ...)")
+              end=s.find("#endif /* KYTY_COMMON_PROFILER_H_ */")
+              if start>=0 and end>start:
+                  s=s[:start]+"""#define KYTY_PROFILER_BLOCK(name, ...) ((void)0)
+          #define KYTY_PROFILER_FUNCTION(...) ((void)0)
+          #define KYTY_PROFILER_THREAD(name) ((void)0)
+
+          """+s[end:]
+                  p.write_text(s,encoding="utf-8")
+          '@ | Set-Content -Encoding UTF8 hotpath.py
+          python hotpath.py
+          Remove-Item hotpath.py
+          "Direct experiment: inactive Tracy hot-path zones removed" | Add-Content applied-patches.txt
+
+      - name: Setup Visual Studio
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Locate vcpkg
+        id: vcpkg
+        shell: pwsh
+        run: |
+          $root = Split-Path (Get-Command vcpkg).Source
+          "root=$root" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Install glslang
+        shell: pwsh
+        run: |
+          vcpkg install glslang[tools,opt]:x64-windows
+          "${{ steps.vcpkg.outputs.root }}\installed\x64-windows\tools\glslang" |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.10.3"
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          cache: true
+
+      - name: Configure AVX2 release build
+        shell: cmd
+        run: |
+          cmake -S . -B _Build\windows -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON ^
+            -DCMAKE_C_FLAGS="/arch:AVX2" ^
+            -DCMAKE_CXX_FLAGS="/arch:AVX2" ^
+            -DKYTY_BUILD_ORIGIN=Fork ^
+            -DKYTY_BUILD_REPOSITORY=shemyaza00-pixel/KytyPS5 ^
+            -DCMAKE_C_COMPILER=clang-cl ^
+            -DCMAKE_CXX_COMPILER=clang-cl ^
+            -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
+
+      - name: Build
+        shell: cmd
+        run: cmake --build _Build\windows --target kyty_emulator launcher --parallel
+
+      - name: Install
+        shell: cmd
+        run: cmake --install _Build\windows --prefix _Build\windows\install
+
+      - name: Package Astro Bot
+        shell: pwsh
+        run: |
+          $install="_Build\windows\install"
+          New-Item -ItemType Directory -Force -Path "$install\_Patches" | Out-Null
+          Copy-Item applied-patches.txt "$install\APPLIED-PATCHES.txt"
+          @'
+          {
+            "id": "PPSA21564",
+            "name": "ASTRO BOT: non RT patch",
+            "version": "01.007.000",
+            "process": "eboot.bin",
+            "source_sha256": "70d673f7c43edb189461a60f076e15baa73f9a82a579603e44372ae5b7225d3d",
+            "mods": [
+              {
+                "name": "Select the existing non-tiled deferred-lighting renderer",
+                "enabled": true,
+                "memory": [
+                  {
+                    "offset": "0x73eb993",
+                    "off": "4584f60f84ed0800004531f64c8d3dea78a40141b430",
+                    "on": "4584f6e9ee080000904531f64c8d3dea78a40141b430"
+                  }
+                ]
+              },
+              {
+                "name": "Disable GI probes and lighting shaders",
+                "enabled": true,
+                "memory": [
+                  {
+                    "offset": "0x711d0b3",
+                    "off": "0fb682800700008887e4050000",
+                    "on": "b80000000090908887e4050000"
+                  }
+                ]
+              }
+            ]
+          }
+          '@ | Set-Content -Encoding UTF8 "$install\_Patches\PPSA21564.json"
+
+          @'
+          @echo off
+          cd /d "%~dp0"
+          set "KYTY_DEFER_RELEASE_MEM_INTERRUPTS=1"
+          kyty_emulator.exe --game "C:\Games\PS5 Games\PPSA21564-app" --game-patch "%~dp0_Patches\PPSA21564.json" --redzone --shader-optimization-type Performance
+          pause
+          '@ | Set-Content -Encoding ASCII "$install\RUN_ASTROBOT.bat"
+
+          @"
+          Variant: ${{ matrix.variant }}
+
+          tuned988perf:
+            4479808 working checkpoint, compatibility patches, #985/#900/#982,
+            #988 when compatible, selected low-risk performance commits, AVX2.
+
+          srt558perf:
+            PR #558 Astro-specific graphics/SRT branch as the base, including its
+            dynamic SRT reads, partial mip residency and real occlusion-query work.
+            The same Windows/Intel/non-RT/performance layer is applied on top.
+
+          No custom A/V sync and no V2 manual mip/depth hacks.
+          "@ | Set-Content -Encoding UTF8 "$install\README-ASTROBOT-NEXT.txt"
+
+      - name: Verify
+        shell: pwsh
+        run: |
+          if (!(Test-Path "_Build\windows\install\kyty_emulator.exe")) { throw "emulator missing" }
+          if (!(Test-Path "_Build\windows\install\launcher.exe")) { throw "launcher missing" }
+          Get-Content "_Build\windows\install\APPLIED-PATCHES.txt"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-AstroBot-${{ matrix.variant }}-Windows-x64
+          path: _Build/windows/install/**
+          if-no-files-found: error
