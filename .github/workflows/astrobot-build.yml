@@ -68,6 +68,235 @@ jobs:
 
           git log -5 --oneline
 
+      - name: Apply performance and A/V sync experiments
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+
+          def read(path):
+              return Path(path).read_text(encoding="utf-8")
+
+          def write(path, text):
+              Path(path).write_text(text, encoding="utf-8")
+
+          def replace_once(text, old, new, label):
+              if old not in text:
+                  raise RuntimeError(f"{label}: expected source text not found")
+              return text.replace(old, new, 1)
+
+          # PR #900 runtime portion: defer interrupt-only RELEASE_MEM flushes.
+          pm_path = "src/graphics/guest_gpu/command_processor/pm4Handlers.cpp"
+          pm = read(pm_path)
+          pm = replace_once(
+              pm,
+              "#include <cstdio>\n#include <cstring>",
+              "#include <cstdio>\n#include <cstdlib>\n#include <cstring>",
+              "#900 include",
+          )
+          pm = replace_once(
+              pm,
+              "namespace {\n\nconstexpr uint32_t GcrGl2MetadataInvalidate",
+              """namespace {
+
+          // Opt-in experiment from PR #900: keep interrupt callbacks queued until an existing
+          // submission boundary. Memory-writing RELEASE_MEM paths retain their normal flushes.
+          bool DeferInterruptOnlyReleaseMemFlushes() {
+              static const bool enabled = [] {
+                  const auto* value = std::getenv("KYTY_DEFER_RELEASE_MEM_INTERRUPTS");
+                  return value != nullptr && value[0] != '\\0' && std::strcmp(value, "0") != 0;
+              }();
+              return enabled;
+          }
+
+          constexpr uint32_t GcrGl2MetadataInvalidate""",
+              "#900 helper",
+          )
+          pm = replace_once(
+              pm,
+              """\t\t\tcase 0x01:
+          \t\t\tcase 0x02:
+          \t\t\tcase 0x04:
+          \t\t\t\tcp.TriggerEopEventAtEndOfPipe(interrupt_context_id);
+          \t\t\t\tcp.BufferFlush();
+          \t\t\t\tbreak;""",
+              """\t\t\tcase 0x01:
+          \t\t\tcase 0x02:
+          \t\t\tcase 0x04:
+          \t\t\t\tcp.TriggerEopEventAtEndOfPipe(interrupt_context_id);
+          \t\t\t\tif (!DeferInterruptOnlyReleaseMemFlushes()) {
+          \t\t\t\t\tcp.BufferFlush();
+          \t\t\t\t}
+          \t\t\t\tbreak;""",
+              "#900 RELEASE_MEM",
+          )
+          write(pm_path, pm)
+
+          # PR #982: keep the Vulkan driver pipeline cache usable across custom builds.
+          pc_path = "src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp"
+          pc = read(pc_path)
+          pc = replace_once(pc, '#include "kytyGitVersion.h"\n', "", "#982 git include")
+          pc = replace_once(
+              pc,
+              "std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {",
+              """// Bumped only when the emulator-side cache wrapper changes. Vulkan validates the
+          // driver payload against the device/driver identity and pipeline contents.
+          constexpr uint32_t kPipelineCacheFormat = 2;
+
+          std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {""",
+              "#982 format",
+          )
+          pc = replace_once(
+              pc,
+              'return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\\n", KYTY_GIT_REVISION,\n\t                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);',
+              'return fmt::format("KytyPC2:{}:{:08x}:{:08x}:{:08x}:{}\\n", kPipelineCacheFormat,\n\t                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);',
+              "#982 signature",
+          )
+          old_git_gate = """\tconst std::string_view git_hash     = KYTY_GIT_HASH;
+          \tconst std::string_view git_revision = KYTY_GIT_REVISION;
+          \tif (git_hash == "unknown" || git_revision == "unknown") {
+          \t\tPipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
+          \t\treturn;
+          \t}
+          \tif (git_hash.ends_with("-dirty")) {
+          \t\tPipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
+          \t\treturn;
+          \t}
+
+          """
+          pc = replace_once(pc, old_git_gate, "", "#982 revision gate")
+          pc = replace_once(
+              pc,
+              "Vulkan pipeline cache: invalidating {} (driver, emulator, or data mismatch)",
+              "Vulkan pipeline cache: invalidating {} (driver, format, or data mismatch)",
+              "#982 log",
+          )
+          write(pc_path, pc)
+
+          # Optional forced A/V sync for AvPlayer. Audio remains the master clock; video frames
+          # that are already too late are recycled instead of being displayed seconds behind.
+          av_path = "src/libs/avPlayer.cpp"
+          av = read(av_path)
+          av = replace_once(
+              av,
+              "#include <cstdio>\n#include <cstring>",
+              "#include <cstdio>\n#include <cstdlib>\n#include <cstring>",
+              "A/V include",
+          )
+          av = replace_once(
+              av,
+              "constexpr int      AVPLAYER_AUDIO_BUFFERS          = 8;\n",
+              """constexpr int      AVPLAYER_AUDIO_BUFFERS          = 8;
+
+          static bool AvPlayerDropLateFramesEnabled() {
+              static const bool enabled = [] {
+                  const auto* value = std::getenv("KYTY_AVPLAYER_DROP_LATE_FRAMES");
+                  return value != nullptr && value[0] != '\\0' && std::strcmp(value, "0") != 0;
+              }();
+              return enabled;
+          }
+
+          static uint64_t AvPlayerSyncToleranceMs() {
+              static const uint64_t tolerance = [] {
+                  constexpr uint64_t DefaultTolerance = 100;
+                  const auto* value = std::getenv("KYTY_AVPLAYER_SYNC_TOLERANCE_MS");
+                  if (value == nullptr || value[0] == '\\0') {
+                      return DefaultTolerance;
+                  }
+                  char* end = nullptr;
+                  const auto parsed = std::strtoull(value, &end, 10);
+                  if (end == value || (end != nullptr && *end != '\\0')) {
+                      return DefaultTolerance;
+                  }
+                  return std::min<uint64_t>(parsed, 1000);
+              }();
+              return tolerance;
+          }
+          """,
+              "A/V helpers",
+          )
+          start = av.index("\tbool Video(AvPlayerFrameInfoEx* out) {")
+          end = av.index("\n\tbool Audio(AvPlayerFrameInfo* out) {", start)
+          new_video = """\tbool Video(AvPlayerFrameInfoEx* out) {
+          \t\tif (out == nullptr) {
+          \t\t\treturn false;
+          \t\t}
+          \t\tstd::lock_guard lock(mutex);
+          \t\tif (state != State::Playing || !video_id) {
+          \t\t\treturn false;
+          \t\t}
+          \t\tconst bool deliver_seek_frame = paused && seek_video_frame_pending;
+          \t\tif (paused && !deliver_seek_frame) {
+          \t\t\treturn false;
+          \t\t}
+
+          \t\tconst bool force_sync = AvPlayerDropLateFramesEnabled() && !deliver_seek_frame &&
+          \t\t                        audio_id.has_value() &&
+          \t\t                        trick_speed == AVPLAYER_TRICK_SPEED_NORMAL;
+          \t\tconst auto tolerance = AvPlayerSyncToleranceMs();
+
+          \t\tif (force_sync) {
+          \t\t\tconst auto now = CurrentTimeNoLock();
+          \t\t\tif (now != 0) {
+          \t\t\t\tfor (;;) {
+          \t\t\t\t\tauto late = video_frames.TryPopIf([&](const ReadyFrame& candidate) {
+          \t\t\t\t\t\tconst auto timestamp =
+          \t\t\t\t\t\t    candidate.info.time_stamp + candidate.timestamp_offset;
+          \t\t\t\t\t\treturn timestamp < now && now - timestamp > tolerance;
+          \t\t\t\t\t});
+          \t\t\t\t\tif (!late) {
+          \t\t\t\t\t\tbreak;
+          \t\t\t\t\t}
+          \t\t\t\t\tRecordLoopBoundary(*late);
+          \t\t\t\t\tvideo_buffers.Push(std::move(late->buffer));
+          \t\t\t\t}
+          \t\t\t}
+          \t\t}
+
+          \t\tauto frame = video_frames.TryPopIf([&](const ReadyFrame& candidate) {
+          \t\t\tif (deliver_seek_frame) {
+          \t\t\t\treturn true;
+          \t\t\t}
+          \t\t\tauto now = CurrentTimeNoLock();
+          \t\t\tif (!force_sync && sync_mode != 0) {
+          \t\t\t\treturn true;
+          \t\t\t}
+          \t\t\treturn now == 0 || candidate.info.time_stamp + candidate.timestamp_offset <= now;
+          \t\t});
+          \t\tif (!frame) {
+          \t\t\treturn false;
+          \t\t}
+          \t\tif (current_video) {
+          \t\t\tretired_video.push_back(std::move(current_video->buffer));
+          \t\t\tif (retired_video.size() >= static_cast<size_t>(max_video_buffers - 1)) {
+          \t\t\t\tvideo_buffers.Push(std::move(retired_video.front()));
+          \t\t\t\tretired_video.pop_front();
+          \t\t\t}
+          \t\t}
+          \t\tcurrent_video = std::move(*frame);
+          \t\t*out          = current_video->info;
+          \t\tRecordLoopBoundary(*current_video);
+          \t\tif (deliver_seek_frame) {
+          \t\t\tseek_video_frame_pending = false;
+          \t\t}
+          \t\treturn true;
+          \t}
+          """
+          av = av[:start] + new_video + av[end:]
+          write(av_path, av)
+          '@ | Set-Content -Encoding UTF8 .astrobot_opt_patch.py
+
+          python .astrobot_opt_patch.py
+          if ($LASTEXITCODE -ne 0) { throw "Failed to apply Astro Bot optimization patch" }
+          Remove-Item .astrobot_opt_patch.py
+
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw "Optimization patch has whitespace errors" }
+          git diff --stat
+          git diff -- src/graphics/guest_gpu/command_processor/pm4Handlers.cpp
+          git diff -- src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+          git diff -- src/libs/avPlayer.cpp
+
       - name: Setup Visual Studio environment
         uses: ilammy/msvc-dev-cmd@v1
 
@@ -158,9 +387,39 @@ jobs:
           @'
           @echo off
           cd /d "%~dp0"
+          set "KYTY_DEFER_RELEASE_MEM_INTERRUPTS=1"
+          set "KYTY_AVPLAYER_DROP_LATE_FRAMES=1"
+          set "KYTY_AVPLAYER_SYNC_TOLERANCE_MS=100"
           kyty_emulator.exe --game "C:\Games\PS5 Games\PPSA21564-app" --game-patch "%~dp0_Patches\PPSA21564.json" --redzone --shader-optimization-type Performance
           pause
           '@ | Set-Content -Encoding ASCII "$install\RUN_ASTROBOT.bat"
+
+          @'
+          @echo off
+          cd /d "%~dp0"
+          set "KYTY_DEFER_RELEASE_MEM_INTERRUPTS=1"
+          set "KYTY_AVPLAYER_DROP_LATE_FRAMES=0"
+          kyty_emulator.exe --game "C:\Games\PS5 Games\PPSA21564-app" --game-patch "%~dp0_Patches\PPSA21564.json" --redzone --shader-optimization-type Performance
+          pause
+          '@ | Set-Content -Encoding ASCII "$install\RUN_ASTROBOT_PERF_ONLY.bat"
+
+          @'
+          @echo off
+          cd /d "%~dp0"
+          set "KYTY_DEFER_RELEASE_MEM_INTERRUPTS=0"
+          set "KYTY_AVPLAYER_DROP_LATE_FRAMES=0"
+          kyty_emulator.exe --game "C:\Games\PS5 Games\PPSA21564-app" --game-patch "%~dp0_Patches\PPSA21564.json" --redzone --shader-optimization-type Performance
+          pause
+          '@ | Set-Content -Encoding ASCII "$install\RUN_ASTROBOT_SAFE.bat"
+
+          @'
+          @echo off
+          cd /d "%~dp0"
+          set "KYTY_DEFER_RELEASE_MEM_INTERRUPTS=1"
+          set "KYTY_AVPLAYER_DROP_LATE_FRAMES=1"
+          set "KYTY_AVPLAYER_SYNC_TOLERANCE_MS=100"
+          start "" launcher.exe
+          '@ | Set-Content -Encoding ASCII "$install\OPEN_LAUNCHER_OPTIMIZED.bat"
 
           @'
           Custom Astro Bot build for PPSA21564 01.007.000.
@@ -168,11 +427,18 @@ jobs:
           Base: PR #780 (itsmemac/spiderman-running-22-09-2026)
           Added: PR #838 (protected-page file-read fix / infinite loading tunnel)
           Added: PR #839 (native EXTRQ trampoline for Intel CPUs)
-          Added: PR #985 (wave-wide zero-branch shader fix / Astro Bot performance test)
+          Added: PR #985 (wave-wide zero-branch shader fix)
+          Added: PR #900 runtime optimization (interrupt-only RELEASE_MEM batching)
+          Added: PR #982 persistent Vulkan pipeline cache
+          Added: optional A/V late-frame dropping (audio-master sync, 100 ms default tolerance)
           Bundled: Astro Bot non-RT patch
           Includes: launcher.exe + Qt runtime
-          Launch game: RUN_ASTROBOT.bat
-          Configure emulator: launcher.exe
+
+          RUN_ASTROBOT.bat           = recommended: batching + forced A/V sync
+          RUN_ASTROBOT_PERF_ONLY.bat = batching on, forced A/V sync off
+          RUN_ASTROBOT_SAFE.bat      = experimental batching and forced A/V sync off
+          OPEN_LAUNCHER_OPTIMIZED.bat = opens the GUI with optimized environment inherited
+          launcher.exe               = normal GUI without experimental environment flags
 
           Expected game path:
           C:\Games\PS5 Games\PPSA21564-app
@@ -188,6 +454,6 @@ jobs:
       - name: Upload custom build
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-AstroBot-PerfTest-Windows-x64
+          name: KytyPS5-AstroBot-Optimized-Windows-x64
           path: _Build/windows/install/**
           if-no-files-found: error
