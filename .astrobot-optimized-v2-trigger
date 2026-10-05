@@ -10,3 +10,4 @@ Retry with manual tail perf ports.
 Retry resilient perf ports.
 Retry core V2 without incompatible tail micro-ports.
 Retry with scoped streamed-mip loop fix.
+Retry after completing #966 QueueSdlAudio port.
