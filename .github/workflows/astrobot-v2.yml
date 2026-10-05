@@ -265,6 +265,7 @@ jobs:
         run: |
           @'
           from pathlib import Path
+          import re
 
           def load(path):
               return Path(path).read_text(encoding="utf-8")
@@ -272,114 +273,94 @@ jobs:
           def save(path, text):
               Path(path).write_text(text, encoding="utf-8")
 
-          def repl(text, old, new, label):
-              if old not in text:
-                  raise RuntimeError(f"{label}: source text not found")
-              return text.replace(old, new, 1)
+          def sub_once(text, pattern, repl, label, flags=0):
+              out, n = re.subn(pattern, repl, text, count=1, flags=flags)
+              if n != 1:
+                  raise RuntimeError(f"{label}: expected one match, got {n}")
+              return out
 
-          # Carry a first-resident mip in ImageInfo.
+          # ImageInfo: remember the first resident mip.
           path = "src/graphics/host_gpu/renderer/image/imageInfo.h"
           s = load(path)
           if "resident_base_level" not in s:
-              s = repl(
+              s = sub_once(
                   s,
-                  """\tImageSubresources            resources;
-          \tuint32_t                     pitch           = 0;""",
-                  """\tImageSubresources            resources;
-          \t// Finest mip level actually resident in guest memory for streamed textures.
-          \tuint32_t                     resident_base_level = 0;
-          \tuint32_t                     pitch           = 0;""",
-                  "image resident mip",
+                  r"(\bImageSubresources\s+resources;\s*\n)",
+                  r"\1\tuint32_t                     resident_base_level = 0;\n",
+                  "ImageInfo resident_base_level",
               )
               save(path, s)
 
-          # Teach tiled transfers to start at the first resident mip.
+          # Tile helper: allow the transfer to begin at a later mip.
           path = "src/graphics/host_gpu/renderer/image/textureCommon.h"
           s = load(path)
-          s = repl(
-              s,
-              """bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferImageCopy>& regions,
-                                            const TextureUploadLayout& layout, uint32_t levels,
-                                            std::vector<GpuTileInfo>& out_tile_infos);""",
-              """bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferImageCopy>& regions,
-                                            const TextureUploadLayout& layout, uint32_t levels,
-                                            std::vector<GpuTileInfo>& out_tile_infos,
-                                            uint32_t base_level = 0);""",
-              "tile header",
-          )
-          save(path, s)
+          if "uint32_t base_level = 0" not in s:
+              s = sub_once(
+                  s,
+                  r"(bool TextureBuildGpuTileInfos\([^;]*?uint32_t levels,\s*\n\s*std::vector<GpuTileInfo>& out_tile_infos)\);",
+                  r"\1,\n                              uint32_t base_level = 0);",
+                  "TextureBuildGpuTileInfos declaration",
+                  re.S,
+              )
+              save(path, s)
 
           path = "src/graphics/host_gpu/renderer/image/textureCommon.cpp"
           s = load(path)
-          s = repl(
-              s,
-              """bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferImageCopy>& regions,
-                                            const TextureUploadLayout& layout, uint32_t levels,
-                                            std::vector<GpuTileInfo>& out_tile_infos) {
-          \tconst auto& description    = layout.surface.description;
-          \tconst bool  volume_texture = description.dimension == TileSurfaceDimension::Dim3D;
-          \tconst auto  depth          = volume_texture ? description.depth : description.layers;
-          \tif (tiled_size == 0 || levels == 0 || levels > 16 || depth == 0 ||
-          \t    regions.size() != GetTextureRegionCount(depth, levels, volume_texture) ||
-          \t    Prospero::IsFmaskTextureFormat(description.format)) {""",
-              """bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferImageCopy>& regions,
-                                            const TextureUploadLayout& layout, uint32_t levels,
-                                            std::vector<GpuTileInfo>& out_tile_infos,
-                                            uint32_t base_level) {
-          \tconst auto& description    = layout.surface.description;
-          \tconst bool  volume_texture = description.dimension == TileSurfaceDimension::Dim3D;
-          \tconst auto  depth          = volume_texture ? description.depth : description.layers;
-          \tconst auto expected_regions = GetTextureRegionCount(depth, levels, volume_texture) -
-          \t                              GetTextureRegionCount(depth, base_level, volume_texture);
-          \tif (tiled_size == 0 || levels == 0 || levels > 16 || depth == 0 || base_level >= levels ||
-          \t    regions.size() != expected_regions ||
-          \t    Prospero::IsFmaskTextureFormat(description.format)) {""",
-              "tile implementation signature",
-          )
-          s = repl(
-              s,
-              "for (uint32_t mip_level = 0; mip_level < levels; ++mip_level) {",
-              "for (uint32_t mip_level = base_level; mip_level < levels; ++mip_level) {",
-              "tile mip loop",
-          )
-          save(path, s)
+          if "uint32_t base_level)" not in s[s.find("bool TextureBuildGpuTileInfos"):s.find("bool TextureBuildGpuTileInfos")+500]:
+              s = sub_once(
+                  s,
+                  r"(bool TextureBuildGpuTileInfos\(uint64_t tiled_size, const std::vector<vk::BufferImageCopy>& regions,\s*\n\s*const TextureUploadLayout& layout, uint32_t levels,\s*\n\s*std::vector<GpuTileInfo>& out_tile_infos)\) \{",
+                  r"\1, uint32_t base_level) {",
+                  "TextureBuildGpuTileInfos definition",
+                  re.S,
+              )
+              s = sub_once(
+                  s,
+                  r"if \(tiled_size == 0 \|\| levels == 0 \|\| levels > 16 \|\| depth == 0 \|\|\s*\n\s*regions\.size\(\) != GetTextureRegionCount\(depth, levels, volume_texture\) \|\|",
+                  "const auto expected_regions = GetTextureRegionCount(depth, levels, volume_texture) -\n"
+                  "\t                              GetTextureRegionCount(depth, base_level, volume_texture);\n"
+                  "\tif (tiled_size == 0 || levels == 0 || levels > 16 || depth == 0 || base_level >= levels ||\n"
+                  "\t    regions.size() != expected_regions ||",
+                  "tile expected regions",
+                  re.S,
+              )
+              s = s.replace(
+                  "for (uint32_t mip_level = 0; mip_level < levels; ++mip_level) {",
+                  "for (uint32_t mip_level = base_level; mip_level < levels; ++mip_level) {",
+                  1,
+              )
+              save(path, s)
 
-          # Avoid uploading guest mips that belong to neighbouring streamed textures.
+          # TextureCache: omit nonresident mips during upload and add a BC7 fallback detector.
           path = "src/graphics/host_gpu/renderer/cache/textureCache.cpp"
           s = load(path)
-          s = repl(
-              s,
-              """\ttransfer.layout  = TextureCalcUploadLayout(format, info.extent.width, info.extent.height,
-          \t                                       info.resources.levels, layers, info.tile_mode,
-          \t                                       info.data.size, allow_depth_tile, volume, owner);
-          \ttransfer.regions = TextureBuildImageCopies(transfer.layout);
-          \tif (info.IsDepth()) {""",
-              """\ttransfer.layout  = TextureCalcUploadLayout(format, info.extent.width, info.extent.height,
-          \t                                       info.resources.levels, layers, info.tile_mode,
-          \t                                       info.data.size, allow_depth_tile, volume, owner);
-          \ttransfer.regions = TextureBuildImageCopies(transfer.layout);
+          if "direction == TransferDirection::Upload ? info.resident_base_level" not in s:
+              needle = "transfer.regions = TextureBuildImageCopies(transfer.layout);"
+              if needle not in s:
+                  raise RuntimeError("transfer.regions anchor not found")
+              s = s.replace(
+                  needle,
+                  needle + """
           \tconst auto tile_base =
           \t    direction == TransferDirection::Upload ? info.resident_base_level : 0u;
           \tif (tile_base != 0) {
           \t\tstd::erase_if(transfer.regions, [tile_base](const vk::BufferImageCopy& region) {
           \t\t\treturn region.imageSubresource.mipLevel < tile_base;
           \t\t});
-          \t}
-          \tif (info.IsDepth()) {""",
-              "filter transfer mips",
-          )
-          s = repl(
-              s,
-              """\t\tif (!TextureBuildGpuTileInfos(info.data.size, transfer.regions, transfer.layout,
-          \t\t                              info.resources.levels, transfer.tiles)) {""",
-              """\t\tif (!TextureBuildGpuTileInfos(info.data.size, transfer.regions, transfer.layout,
-          \t\t                              info.resources.levels, transfer.tiles, tile_base)) {""",
-              "pass tile base",
-          )
+          \t}""",
+                  1,
+              )
+              s = sub_once(
+                  s,
+                  r"TextureBuildGpuTileInfos\(info\.data\.size, transfer\.regions, transfer\.layout,\s*\n\s*info\.resources\.levels, transfer\.tiles\)",
+                  "TextureBuildGpuTileInfos(info.data.size, transfer.regions, transfer.layout,\n"
+                  "\t\t                              info.resources.levels, transfer.tiles, tile_base)",
+                  "TextureBuildGpuTileInfos call",
+                  re.S,
+              )
 
-          # Heuristic fallback for BC7 streamed textures whose descriptors do not advertise MIN_LOD.
-          init_marker = "void TextureCache::InitializeImage(ImageId id) {"
           if "FindResidentBaseLevel" not in s:
+              marker = "void TextureCache::InitializeImage(ImageId id) {"
               helper = r'''namespace {
 
           [[nodiscard]] uint32_t FindResidentBaseLevel(const ImageInfo& info) {
@@ -423,91 +404,66 @@ jobs:
           } // namespace
 
           '''
-              if init_marker not in s:
+              if marker not in s:
                   raise RuntimeError("InitializeImage marker not found")
-              s = s.replace(init_marker, helper + init_marker, 1)
+              s = s.replace(marker, helper + marker, 1)
+              s = sub_once(
+                  s,
+                  r"(if \(image\.info\.samples > 1\) \{\s*\n\s*return;\s*\n\s*\}\s*\n)(\s*const bool upload)",
+                  r"\1\tif (image.info.resident_base_level == 0) {\n"
+                  r"\t\timage.info.resident_base_level = FindResidentBaseLevel(image.info);\n"
+                  r"\t}\n\2",
+                  "InitializeImage resident level",
+                  re.S,
+              )
+              save(path, s)
 
-          s = repl(
-              s,
-              """\tif (image.info.samples > 1) {
-          \t\treturn;
-          \t}
-          \tconst bool upload = image.IsBufferModified() || image.IsCpuDirty();""",
-              """\tif (image.info.samples > 1) {
-          \t\treturn;
-          \t}
-          \tif (image.info.resident_base_level == 0) {
-          \t\timage.info.resident_base_level = FindResidentBaseLevel(image.info);
-          \t}
-          \tconst bool upload = image.IsBufferModified() || image.IsCpuDirty();""",
-              "initialize resident mip",
-          )
-          save(path, s)
-
-          # Clamp the Vulkan view and store the T# MIN_LOD residency hint.
+          # Descriptor: MIN_LOD is the first strong residency hint, and the view must not expose
+          # mips before it.
           path = "src/graphics/host_gpu/renderer/pipeline/descriptors.cpp"
           s = load(path)
-          s = repl(
-              s,
-              """static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
-                                                   const ShaderTextureResource& descriptor, vk::Format format,
-                                                   const SurfaceFormatInfo& surface_format, bool storage,
-                                                   uint32_t view_levels, uint32_t image_layers) {
-          \tImageViewInfo view {};
-          \tview.format      = format;
-          \tview.aspect      = vk::ImageAspectFlagBits::eColor;
-          \tview.base_level  = descriptor.BaseLevel();
-          \tview.level_count = view_levels;""",
-              """static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
-                                                   const ShaderTextureResource& descriptor, vk::Format format,
-                                                   const SurfaceFormatInfo& surface_format, bool storage,
-                                                   uint32_t view_levels, uint32_t image_layers,
-                                                   uint32_t resident_base) {
-          \tImageViewInfo view {};
-          \tview.format = format;
-          \tview.aspect = vk::ImageAspectFlagBits::eColor;
-          \tconst auto first_level = std::max<uint32_t>(descriptor.BaseLevel(), resident_base);
-          \tview.base_level = first_level;
-          \tview.level_count =
-          \t    view_levels > (first_level - descriptor.BaseLevel())
-          \t        ? view_levels - (first_level - descriptor.BaseLevel())
-          \t        : 1u;""",
-              "texture view resident base",
-          )
-          s = repl(
-              s,
-              """\tconst auto base_lod = view.base_level * 256u;
-          \tif (descriptor.MinLod() > base_lod) {
-          \t\tview.min_lod = descriptor.MinLod() - base_lod;
-          \t}""",
-              """\tconst auto base_lod = view.base_level * 256u;
-          \tif (descriptor.MinLod() > base_lod) {
-          \t\tview.min_lod = descriptor.MinLod() - base_lod;
-          \t}""",
-              "keep min lod",
-          )
-          # Find the final ImageInfo assignments using a stable anchor near bytes_per_block.
-          anchor = """\tdesc.info.extent       = {width, height, volume ? depth : 1u};
-          \tdesc.info.resources    = {levels, image_layers};
-          \tdesc.info.pitch        = pitch;"""
-          if anchor not in s:
-              raise RuntimeError("descriptor info anchor not found")
-          s = s.replace(
-              anchor,
-              """\tdesc.info.extent       = {width, height, volume ? depth : 1u};
-          \tdesc.info.resources    = {levels, image_layers};
-          \tdesc.info.resident_base_level =
-          \t    multisampled ? 0u : std::min<uint32_t>(descriptor.MinLod() >> 8u, levels - 1u);
-          \tdesc.info.pitch        = pitch;""",
-              1,
-          )
-          old_call = """\tdesc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
-          \t                                 view_levels, desc.info.resources.layers);"""
-          new_call = """\tdesc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
-          \t                                 view_levels, desc.info.resources.layers,
-          \t                                 desc.info.resident_base_level);"""
-          s = repl(s, old_call, new_call, "texture view call")
-          save(path, s)
+          if "uint32_t resident_base)" not in s:
+              s = sub_once(
+                  s,
+                  r"(static ImageViewInfo TextureViewInfo\(const ShaderRecompiler::IR::ImageResource& resource,\s*\n\s*const ShaderTextureResource& descriptor, vk::Format format,\s*\n\s*const SurfaceFormatInfo& surface_format, bool storage,\s*\n\s*uint32_t view_levels, uint32_t image_layers)\) \{",
+                  r"\1, uint32_t resident_base) {",
+                  "TextureViewInfo signature",
+                  re.S,
+              )
+              s = sub_once(
+                  s,
+                  r"view\.format\s*= format;\s*\n\s*view\.aspect\s*= vk::ImageAspectFlagBits::eColor;\s*\n\s*view\.base_level\s*= descriptor\.BaseLevel\(\);\s*\n\s*view\.level_count\s*= view_levels;",
+                  "view.format = format;\n"
+                  "\tview.aspect = vk::ImageAspectFlagBits::eColor;\n"
+                  "\tconst auto first_level = std::max<uint32_t>(descriptor.BaseLevel(), resident_base);\n"
+                  "\tview.base_level = first_level;\n"
+                  "\tview.level_count =\n"
+                  "\t    view_levels > (first_level - descriptor.BaseLevel())\n"
+                  "\t        ? view_levels - (first_level - descriptor.BaseLevel())\n"
+                  "\t        : 1u;",
+                  "TextureViewInfo levels",
+                  re.S,
+              )
+
+          if "desc.info.resident_base_level" not in s:
+              s = sub_once(
+                  s,
+                  r"(desc\.info\.extent\s*= \{width, height, volume \? depth : 1u\};\s*\n\s*desc\.info\.resources\s*= \{levels, image_layers\};\s*\n)",
+                  r"\1\tdesc.info.resident_base_level =\n"
+                  r"\t    multisampled ? 0u : std::min<uint32_t>(descriptor.MinLod() >> 8u, levels - 1u);\n",
+                  "descriptor resident level",
+                  re.S,
+              )
+              s = sub_once(
+                  s,
+                  r"TextureViewInfo\(resource, descriptor, view_format, surface_format, storage,\s*\n\s*view_levels, desc\.info\.resources\.layers\)",
+                  "TextureViewInfo(resource, descriptor, view_format, surface_format, storage,\n"
+                  "\t                                 view_levels, desc.info.resources.layers,\n"
+                  "\t                                 desc.info.resident_base_level)",
+                  "TextureViewInfo call",
+                  re.S,
+              )
+              save(path, s)
           '@ | Set-Content -Encoding UTF8 .port_streamed_mips.py
 
           python .port_streamed_mips.py
