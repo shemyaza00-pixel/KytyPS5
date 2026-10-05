@@ -1,0 +1,444 @@
+name: Astro Bot graphics and performance Windows build
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [gfxcache447, gfxperf447]
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout 2026-10-01 checkpoint
+        uses: actions/checkout@v4
+        with:
+          repository: KytyPS5/KytyPS5
+          ref: 44798085bd26fd27078671789f5e8426aeb21521
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Configure patch sources
+        shell: pwsh
+        run: |
+          git config user.name "AstroBot CI"
+          git config user.email "actions@users.noreply.github.com"
+          git fetch origin refs/pull/838/head:pr838
+          git fetch origin 8c4224908b758abd91cf3a3f36fbe1be1b2f5e0a
+          git fetch origin refs/pull/985/head:pr985
+          git fetch origin e317465d8a773b33482ad367ad2f856154c8bc6d
+          git fetch origin refs/pull/491/head:pr491
+          git fetch origin 74a78f37d08fabae0a37e621ef209786796c37fe
+          git fetch origin refs/pull/988/head:pr988
+
+      - name: Apply tuned447 compatibility and shader-loop fixes
+        shell: pwsh
+        run: |
+          git cherry-pick pr838
+          if ($LASTEXITCODE -ne 0) { git status --short; throw "#838 failed" }
+
+          git cherry-pick 8c4224908b758abd91cf3a3f36fbe1be1b2f5e0a
+          if ($LASTEXITCODE -ne 0) { git status --short; throw "compatible #839 failed" }
+
+          $commits985 = @(git rev-list --reverse e317465d8a773b33482ad367ad2f856154c8bc6d..pr985)
+          foreach ($commit in $commits985) {
+            git cherry-pick $commit
+            if ($LASTEXITCODE -ne 0) {
+              $unmerged = @(git diff --name-only --diff-filter=U)
+              if ($unmerged.Count -gt 0 -and ($unmerged | Where-Object { $_ -notlike "tests/*" }).Count -eq 0) {
+                foreach ($file in $unmerged) {
+                  git checkout --theirs -- $file
+                  git add $file
+                }
+                git -c core.editor=true cherry-pick --continue
+              }
+              if ($LASTEXITCODE -ne 0) { git status --short; throw "#985 failed at $commit" }
+            }
+          }
+
+      - name: Port RELEASE_MEM batching from PR 900
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+
+          p = Path("src/graphics/guest_gpu/command_processor/pm4Handlers.cpp")
+          s = p.read_text(encoding="utf-8")
+
+          def once(old, new, label):
+              global s
+              if old not in s:
+                  raise RuntimeError(f"{label}: expected text not found")
+              s = s.replace(old, new, 1)
+
+          if "DeferInterruptOnlyReleaseMemFlushes" not in s:
+              once("#include <cstdio>\n#include <cstring>",
+                   "#include <cstdio>\n#include <cstdlib>\n#include <cstring>", "include")
+              once("namespace {\n\nconstexpr uint32_t GcrGl2MetadataInvalidate",
+          """namespace {
+
+          bool DeferInterruptOnlyReleaseMemFlushes() {
+              static const bool enabled = [] {
+                  const auto* value = std::getenv("KYTY_DEFER_RELEASE_MEM_INTERRUPTS");
+                  return value != nullptr && value[0] != '\\0' && std::strcmp(value, "0") != 0;
+              }();
+              return enabled;
+          }
+
+          constexpr uint32_t GcrGl2MetadataInvalidate""", "helper")
+              once(
+          """\t\t\tcase 0x01:
+          \t\t\tcase 0x02:
+          \t\t\tcase 0x04:
+          \t\t\t\tcp.TriggerEopEventAtEndOfPipe(interrupt_context_id);
+          \t\t\t\tcp.BufferFlush();
+          \t\t\t\tbreak;""",
+          """\t\t\tcase 0x01:
+          \t\t\tcase 0x02:
+          \t\t\tcase 0x04:
+          \t\t\t\tcp.TriggerEopEventAtEndOfPipe(interrupt_context_id);
+          \t\t\t\tif (!DeferInterruptOnlyReleaseMemFlushes()) {
+          \t\t\t\t\tcp.BufferFlush();
+          \t\t\t\t}
+          \t\t\t\tbreak;""", "release_mem")
+              p.write_text(s, encoding="utf-8")
+          '@ | Set-Content -Encoding UTF8 .port900.py
+          python .port900.py
+          if ($LASTEXITCODE -ne 0) { throw "#900 runtime port failed" }
+          Remove-Item .port900.py
+
+      - name: Apply depth comparison graphics fix
+        shell: pwsh
+        run: |
+          $commits491 = @(git rev-list --reverse 74a78f37d08fabae0a37e621ef209786796c37fe..pr491)
+          Write-Host "#491 commits: $($commits491 -join ', ')"
+          foreach ($commit in $commits491) {
+            git cherry-pick $commit
+            if ($LASTEXITCODE -ne 0) {
+              $unmerged = @(git diff --name-only --diff-filter=U)
+              if ($unmerged.Count -gt 0 -and ($unmerged | Where-Object { $_ -notlike "tests/*" }).Count -eq 0) {
+                foreach ($file in $unmerged) {
+                  git checkout --theirs -- $file
+                  git add $file
+                }
+                git -c core.editor=true cherry-pick --continue
+              }
+              if ($LASTEXITCODE -ne 0) {
+                $unmerged | ForEach-Object { Write-Host "Unresolved #491: $_" }
+                throw "#491 failed at $commit"
+              }
+            }
+          }
+
+      - name: Apply shader disk cache PR 988
+        shell: pwsh
+        run: |
+          $commits988 = @(git rev-list --reverse e317465d8a773b33482ad367ad2f856154c8bc6d..pr988)
+          Write-Host "#988 commits: $($commits988 -join ', ')"
+          foreach ($commit in $commits988) {
+            git cherry-pick $commit
+            if ($LASTEXITCODE -ne 0) {
+              $unmerged = @(git diff --name-only --diff-filter=U)
+              if ($unmerged.Count -gt 0 -and ($unmerged | Where-Object { $_ -notlike "tests/*" }).Count -eq 0) {
+                foreach ($file in $unmerged) {
+                  git checkout --theirs -- $file
+                  git add $file
+                }
+                git -c core.editor=true cherry-pick --continue
+              }
+              if ($LASTEXITCODE -ne 0) {
+                $unmerged | ForEach-Object { Write-Host "Unresolved #988: $_" }
+                throw "#988 failed at $commit"
+              }
+            }
+          }
+
+      - name: Make 988 compatible with manual depth specialization and persistent Vulkan cache
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+
+          # Our graphics fix extends the sampler/image specialization. Include those values
+          # in the disk-cache serialization/key so a warm run cannot reuse the wrong compare mode.
+          cache = Path("src/graphics/shader/recompiler/ShaderDiskCache.cpp")
+          s = cache.read_text(encoding="utf-8")
+          if "Serialize(ar, v.depth_compare_func);" not in s:
+              old = """\tSerialize(ar, v.force_point_filtering);
+          \tSerialize(ar, v.depth_compare);
+          \tSerialize(ar, v.integer_border);"""
+              new = """\tSerialize(ar, v.force_point_filtering);
+          \tSerialize(ar, v.depth_compare);
+          \tSerialize(ar, v.depth_compare_func);
+          \tSerialize(ar, v.integer_border);"""
+              if old not in s:
+                  raise RuntimeError("ShaderDiskCache SamplerResource layout not found")
+              s = s.replace(old, new, 1)
+          # Bump our local format because the serialized plan differs from upstream #988.
+          s = s.replace("inline constexpr uint32_t kFormatVersion = 1;", "inline constexpr uint32_t kFormatVersion = 2;")
+          cache.write_text(s, encoding="utf-8")
+
+          h = Path("src/graphics/shader/recompiler/ShaderDiskCache.h")
+          hs = h.read_text(encoding="utf-8")
+          hs = hs.replace("inline constexpr uint32_t kFormatVersion = 1;", "inline constexpr uint32_t kFormatVersion = 2;")
+          h.write_text(hs, encoding="utf-8")
+
+          pc = Path("src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp")
+          p = pc.read_text(encoding="utf-8")
+          image_anchor = """\t\t\tkey.Add(image.cube);
+          \t\t\tkey.Add(image.fmask);"""
+          if "image.needs_manual_depth_compare" not in p:
+              if image_anchor not in p:
+                  raise RuntimeError("PermutationKey image anchor not found")
+              p = p.replace(image_anchor, """\t\t\tkey.Add(image.cube);
+          \t\t\tkey.Add(image.fmask);
+          \t\t\tkey.Add(image.needs_manual_depth_compare);""", 1)
+          if "spec.sampler_depth_compare_funcs" not in p:
+              marker = """\t\t}
+          \t\treturn key.Finish();
+          \t}
+
+          \ttemplate <typename InputInfo>"""
+              replacement = """\t\t}
+          \t\tkey.Add(static_cast<uint64_t>(spec.sampler_depth_compare_funcs.size()));
+          \t\tfor (const auto compare: spec.sampler_depth_compare_funcs) {
+          \t\t\tkey.Add(compare);
+          \t\t}
+          \t\treturn key.Finish();
+          \t}
+
+          \ttemplate <typename InputInfo>"""
+              if marker not in p:
+                  raise RuntimeError("PermutationKey tail not found")
+              p = p.replace(marker, replacement, 1)
+
+          # PR #982 semantics, kept alongside #988's KYTY_RECOMPILER_SIGNATURE include.
+          if "kPipelineCacheFormat" not in p:
+              anchor = "std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {"
+              if anchor not in p:
+                  raise RuntimeError("DriverCacheSignature not found")
+              p = p.replace(anchor, """constexpr uint32_t kPipelineCacheFormat = 2;
+
+          std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {""", 1)
+          old_sig = 'return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\\n", KYTY_GIT_REVISION,'
+          if old_sig in p:
+              p = p.replace(old_sig,
+                  'return fmt::format("KytyPC2:{}:{:08x}:{:08x}:{:08x}:{}\\n", kPipelineCacheFormat,', 1)
+          # Remove only the revision/dirty gate; #988 still needs kytyGitVersion.h for its signature.
+          gate_start = p.find("\tconst std::string_view git_hash     = KYTY_GIT_HASH;")
+          if gate_start >= 0:
+              gate_end = p.find("\n\tconst auto properties", gate_start)
+              if gate_end < 0:
+                  raise RuntimeError("pipeline revision gate end not found")
+              p = p[:gate_start] + p[gate_end+1:]
+          p = p.replace("driver, emulator, or data mismatch", "driver, format, or data mismatch")
+          pc.write_text(p, encoding="utf-8")
+          '@ | Set-Content -Encoding UTF8 .cache_compat.py
+
+          python .cache_compat.py
+          if ($LASTEXITCODE -ne 0) { throw "cache compatibility port failed" }
+          Remove-Item .cache_compat.py
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw "cache compatibility whitespace check failed" }
+
+      - name: Apply conservative performance patches
+        if: matrix.variant == 'gfxperf447'
+        shell: pwsh
+        run: |
+          foreach ($commit in @(
+            "64eea6b32d52bdd27075d0b5dec2f2152cebf893",
+            "b86cf0a8c26294bd001946dca314f53254c65002",
+            "2b2915e200420249519159ac79d759634fa34cf7",
+            "71017416bcbb8bbbe7d795c1f5ece5c41d4c0a13",
+            "a67a033f959bb338add618f7eee240fe40e6f5a7",
+            "a9620f989a1b6efda5d183823fc88f4313c29d54",
+            "8fa116eeb157964ea3b7aec1eed4d6e9d87e11de",
+            "0bb2bdad17f69c3adc50934da88319826ae6adf5"
+          )) {
+            git fetch origin $commit
+            git cherry-pick $commit
+            if ($LASTEXITCODE -ne 0) {
+              $unmerged = @(git diff --name-only --diff-filter=U)
+              if ($unmerged.Count -gt 0 -and ($unmerged | Where-Object { $_ -notlike "tests/*" }).Count -eq 0) {
+                foreach ($file in $unmerged) {
+                  git checkout --theirs -- $file
+                  git add $file
+                }
+                git -c core.editor=true cherry-pick --continue
+              }
+              if ($LASTEXITCODE -ne 0) {
+                $unmerged | ForEach-Object { Write-Host "Unresolved perf commit: $_" }
+                throw "Performance commit failed: $commit"
+              }
+            }
+          }
+
+      - name: Apply user-CPU hot-path experiment
+        if: matrix.variant == 'gfxperf447'
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+
+          # The user is on an i7-7700 (AVX2 capable). Remove inactive Tracy zone construction
+          # from very hot renderer/command paths in this experimental build.
+          p = Path("src/common/profiler.h")
+          s = p.read_text(encoding="utf-8")
+          start = s.index("#define KYTY_PROFILER_BLOCK(name, ...)")
+          end = s.index("#endif /* KYTY_COMMON_PROFILER_H_ */")
+          replacement = """#define KYTY_PROFILER_BLOCK(name, ...) ((void)0)
+          #define KYTY_PROFILER_FUNCTION(...) ((void)0)
+          #define KYTY_PROFILER_THREAD(name) ((void)0)
+
+          """
+          s = s[:start] + replacement + s[end:]
+          p.write_text(s, encoding="utf-8")
+          '@ | Set-Content -Encoding UTF8 .hotpath.py
+          python .hotpath.py
+          if ($LASTEXITCODE -ne 0) { throw "hot-path experiment failed" }
+          Remove-Item .hotpath.py
+
+      - name: Setup Visual Studio environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Locate vcpkg
+        id: vcpkg
+        shell: pwsh
+        run: |
+          $vcpkgRoot = Split-Path (Get-Command vcpkg).Source
+          "root=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Install glslang
+        shell: pwsh
+        run: |
+          vcpkg install glslang[tools,opt]:x64-windows
+          "${{ steps.vcpkg.outputs.root }}\installed\x64-windows\tools\glslang" |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.10.3"
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          cache: true
+
+      - name: Configure
+        shell: cmd
+        run: |
+          if "${{ matrix.variant }}"=="gfxperf447" (
+            cmake -S . -B _Build\windows -G Ninja ^
+              -DCMAKE_BUILD_TYPE=Release ^
+              -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON ^
+              -DCMAKE_C_FLAGS="/arch:AVX2" ^
+              -DCMAKE_CXX_FLAGS="/arch:AVX2" ^
+              -DKYTY_BUILD_ORIGIN=Fork ^
+              -DKYTY_BUILD_REPOSITORY=shemyaza00-pixel/KytyPS5 ^
+              -DCMAKE_C_COMPILER=clang-cl ^
+              -DCMAKE_CXX_COMPILER=clang-cl ^
+              -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
+          ) else (
+            cmake -S . -B _Build\windows -G Ninja ^
+              -DCMAKE_BUILD_TYPE=Release ^
+              -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON ^
+              -DKYTY_BUILD_ORIGIN=Fork ^
+              -DKYTY_BUILD_REPOSITORY=shemyaza00-pixel/KytyPS5 ^
+              -DCMAKE_C_COMPILER=clang-cl ^
+              -DCMAKE_CXX_COMPILER=clang-cl ^
+              -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
+          )
+
+      - name: Build
+        shell: cmd
+        run: |
+          cmake --build _Build\windows --target kyty_emulator launcher --parallel
+
+      - name: Install
+        shell: cmd
+        run: |
+          cmake --install _Build\windows --prefix _Build\windows\install
+
+      - name: Package Astro Bot files
+        shell: pwsh
+        run: |
+          $install = "_Build\windows\install"
+          New-Item -ItemType Directory -Force -Path "$install\_Patches" | Out-Null
+          @'
+          {
+            "id": "PPSA21564",
+            "name": "ASTRO BOT: non RT patch",
+            "version": "01.007.000",
+            "process": "eboot.bin",
+            "source_sha256": "70d673f7c43edb189461a60f076e15baa73f9a82a579603e44372ae5b7225d3d",
+            "mods": [
+              {
+                "name": "Select the existing non-tiled deferred-lighting renderer",
+                "enabled": true,
+                "memory": [
+                  {
+                    "offset": "0x73eb993",
+                    "off": "4584f60f84ed0800004531f64c8d3dea78a40141b430",
+                    "on": "4584f6e9ee080000904531f64c8d3dea78a40141b430"
+                  }
+                ]
+              },
+              {
+                "name": "Disable GI probes and lighting shaders",
+                "enabled": true,
+                "memory": [
+                  {
+                    "offset": "0x711d0b3",
+                    "off": "0fb682800700008887e4050000",
+                    "on": "b80000000090908887e4050000"
+                  }
+                ]
+              }
+            ]
+          }
+          '@ | Set-Content -Encoding UTF8 "$install\_Patches\PPSA21564.json"
+
+          @'
+          @echo off
+          cd /d "%~dp0"
+          set "KYTY_DEFER_RELEASE_MEM_INTERRUPTS=1"
+          kyty_emulator.exe --game "C:\Games\PS5 Games\PPSA21564-app" --game-patch "%~dp0_Patches\PPSA21564.json" --redzone --shader-optimization-type Performance
+          pause
+          '@ | Set-Content -Encoding ASCII "$install\RUN_ASTROBOT.bat"
+
+          @"
+          Astro Bot graphics/performance experiment
+
+          Variant: ${{ matrix.variant }}
+          Base: official 4479808
+          Common: #838 + compatible #839 + #985 + #900 + #982 semantics
+          Graphics: PR #491 manual depth comparison / depth-view fixes
+          Shader reuse: PR #988 disk cache, locally keyed for the #491 specialization
+          Custom A/V sync: NOT included
+          Manual streamed-mip/depth-target V2 hacks: NOT included
+
+          gfxperf447 additionally carries conservative renderer hot-path commits,
+          AVX2 code generation for the user's i7-7700, and removes inactive Tracy hot-path zones.
+          "@ | Set-Content -Encoding UTF8 "$install\README-ASTROBOT-GFXPERF.txt"
+
+      - name: Verify
+        shell: pwsh
+        run: |
+          if (!(Test-Path "_Build\windows\install\kyty_emulator.exe")) { throw "kyty_emulator.exe missing" }
+          if (!(Test-Path "_Build\windows\install\launcher.exe")) { throw "launcher.exe missing" }
+          if (!(Test-Path "_Build\windows\install\RUN_ASTROBOT.bat")) { throw "RUN_ASTROBOT.bat missing" }
+          Get-ChildItem "_Build\windows\install"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-AstroBot-${{ matrix.variant }}-Windows-x64
+          path: _Build/windows/install/**
+          if-no-files-found: error
