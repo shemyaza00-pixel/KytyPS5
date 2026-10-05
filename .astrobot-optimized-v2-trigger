@@ -8,3 +8,4 @@ Retry with clean mip port only.
 Retry with manual depth-target port.
 Retry with manual tail perf ports.
 Retry resilient perf ports.
+Retry core V2 without incompatible tail micro-ports.
