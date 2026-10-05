@@ -31,7 +31,6 @@ jobs:
           git fetch upstream 8c4224908b758abd91cf3a3f36fbe1be1b2f5e0a
           git fetch upstream refs/pull/985/head:pr985
           git fetch upstream e317465d8a773b33482ad367ad2f856154c8bc6d
-          git fetch upstream 37c8482d4ed87bf8a3540217d0ec42f50ef7a4d1
           git fetch upstream 8fa116eeb157964ea3b7aec1eed4d6e9d87e11de
           git fetch upstream 0bb2bdad17f69c3adc50934da88319826ae6adf5
           git fetch upstream 0ce84e59b66f788108280d450ee7d66b834d0949
@@ -74,13 +73,7 @@ jobs:
           # The streamed-mip correction is ported in a dedicated step below instead of
           # cherry-picking the PR #558 commit, which contains diagnostics and branch-specific code.
 
-          # Fix mismatched depth/colour attachment extents observed in Astro.
-          git cherry-pick 37c8482d4ed87bf8a3540217d0ec42f50ef7a4d1
-          if ($LASTEXITCODE -ne 0) {
-            $unmerged = @(git diff --name-only --diff-filter=U)
-            $unmerged | ForEach-Object { Write-Host "Unresolved depth-target fix: $_" }
-            throw "Depth-target rendering fix failed"
-          }
+          # The depth/colour attachment mismatch correction is ported onto #985 below.
 
           # Performance commits not already in #985 ancestry.
           foreach ($commit in @(
@@ -501,6 +494,43 @@ jobs:
           Remove-Item .port_streamed_mips.py
           git diff --check
           if ($LASTEXITCODE -ne 0) { throw "Streamed-mip port has whitespace errors" }
+
+      - name: Port Astro depth-target mismatch fix
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+
+          p = Path("src/graphics/host_gpu/renderer/renderDraw.cpp")
+          s = p.read_text(encoding="utf-8")
+          marker = "\tif (depth.image_id) {\n"
+          if "depth target %ux%u does not match colour %ux%u" not in s:
+              idx = s.index(marker, s.index("RenderState RenderExecutor::AcquireRenderTargets"))
+              guard = r'''	// Vulkan has one render area for all attachments. Astro can leave a stale depth
+          	// target bound whose extent differs from the active colour target; keeping it bound
+          	// clips one attachment to the other's size and leaves large stale/corrupt regions.
+          	if (depth.image_id && color_count > 0 &&
+          	    (depth.desc.info.extent.width != state.width ||
+          	     depth.desc.info.extent.height != state.height)) {
+          		static std::atomic_bool logged = false;
+          		if (!logged.exchange(true, std::memory_order_relaxed)) {
+          			LOGF("RenderState: depth target %ux%u does not match colour %ux%u -- unbinding it "
+          			     "for the draw\n",
+          			     depth.desc.info.extent.width, depth.desc.info.extent.height, state.width,
+          			     state.height);
+          		}
+          		depth.image_id = {};
+          	}
+          '''
+              s = s[:idx] + guard + s[idx:]
+              p.write_text(s, encoding="utf-8")
+          '@ | Set-Content -Encoding UTF8 .port_astro_depth.py
+
+          python .port_astro_depth.py
+          if ($LASTEXITCODE -ne 0) { throw "Failed to port Astro depth-target mismatch fix" }
+          Remove-Item .port_astro_depth.py
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw "Depth-target port has whitespace errors" }
 
       - name: Apply batching and persistent Vulkan cache
         shell: pwsh
