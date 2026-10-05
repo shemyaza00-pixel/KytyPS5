@@ -22,7 +22,7 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Apply Astro Bot fixes (#838 and #839)
+      - name: Apply Astro Bot fixes (#838, #839 and #985)
         shell: pwsh
         run: |
           git config user.name "AstroBot CI"
@@ -30,6 +30,8 @@ jobs:
           git remote add upstream https://github.com/KytyPS5/KytyPS5.git
           git fetch upstream refs/pull/838/head:pr838
           git fetch upstream 8c4224908b758abd91cf3a3f36fbe1be1b2f5e0a
+          git fetch upstream refs/pull/985/head:pr985
+          git fetch upstream e317465d8a773b33482ad367ad2f856154c8bc6d
 
           git cherry-pick pr838
           if ($LASTEXITCODE -ne 0) { throw "Cherry-pick #838 failed" }
@@ -38,6 +40,13 @@ jobs:
           # The later merged commit was rewritten for newer main internals and does not build on #780.
           git cherry-pick 8c4224908b758abd91cf3a3f36fbe1be1b2f5e0a
           if ($LASTEXITCODE -ne 0) { throw "Cherry-pick tested #839 revision failed" }
+
+          # PR #985 fixes Astro Bot's wave-wide *Zero shader branch behavior.
+          $perfCommits = git rev-list --reverse e317465d8a773b33482ad367ad2f856154c8bc6d..pr985
+          foreach ($commit in $perfCommits) {
+            git cherry-pick $commit
+            if ($LASTEXITCODE -ne 0) { throw "Cherry-pick #985 failed at $commit" }
+          }
 
           $markers = git grep -n -E '^(<<<<<<<|=======|>>>>>>>)' -- '*.cpp' '*.h' 2>$null
           if ($LASTEXITCODE -eq 0 -and $markers) {
@@ -64,24 +73,33 @@ jobs:
           "${{ steps.vcpkg.outputs.root }}\installed\x64-windows\tools\glslang" |
             Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
+      - name: Install Qt 6.10.3
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.10.3"
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          cache: true
+
       - name: Configure
         shell: cmd
         run: |
           cmake -S . -B _Build\windows -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON ^
-            -DKYTY_BUILD_LAUNCHER=OFF ^
             -DKYTY_BUILD_ORIGIN=Fork ^
             -DKYTY_BUILD_REPOSITORY=shemyaza00-pixel/KytyPS5 ^
             -DCMAKE_C_COMPILER=clang-cl ^
-            -DCMAKE_CXX_COMPILER=clang-cl
+            -DCMAKE_CXX_COMPILER=clang-cl ^
+            -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
 
-      - name: Build emulator
+      - name: Build emulator and launcher
         shell: cmd
         run: |
-          cmake --build _Build\windows --target kyty_emulator --parallel
+          cmake --build _Build\windows --target kyty_emulator launcher --parallel
 
-      - name: Install emulator
+      - name: Install emulator and launcher
         shell: cmd
         run: |
           cmake --install _Build\windows --prefix _Build\windows\install
@@ -128,7 +146,7 @@ jobs:
           @'
           @echo off
           cd /d "%~dp0"
-          kyty_emulator.exe --game "C:\Games\PS5 Games\PPSA21564-app" --game-patch "%~dp0_Patches\PPSA21564.json" --redzone
+          kyty_emulator.exe --game "C:\Games\PS5 Games\PPSA21564-app" --game-patch "%~dp0_Patches\PPSA21564.json" --redzone --shader-optimization-type Performance
           pause
           '@ | Set-Content -Encoding ASCII "$install\RUN_ASTROBOT.bat"
 
@@ -138,8 +156,11 @@ jobs:
           Base: PR #780 (itsmemac/spiderman-running-22-09-2026)
           Added: PR #838 (protected-page file-read fix / infinite loading tunnel)
           Added: PR #839 (native EXTRQ trampoline for Intel CPUs)
+          Added: PR #985 (wave-wide zero-branch shader fix / Astro Bot performance test)
           Bundled: Astro Bot non-RT patch
-          Launch: RUN_ASTROBOT.bat
+          Includes: launcher.exe + Qt runtime
+          Launch game: RUN_ASTROBOT.bat
+          Configure emulator: launcher.exe
 
           Expected game path:
           C:\Games\PS5 Games\PPSA21564-app
@@ -150,10 +171,11 @@ jobs:
         run: |
           Get-ChildItem -Recurse "_Build\windows\install"
           if (!(Test-Path "_Build\windows\install\kyty_emulator.exe")) { throw "kyty_emulator.exe missing" }
+          if (!(Test-Path "_Build\windows\install\launcher.exe")) { throw "launcher.exe missing" }
 
       - name: Upload custom build
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-AstroBot-Windows-x64
+          name: KytyPS5-AstroBot-PerfTest-Windows-x64
           path: _Build/windows/install/**
           if-no-files-found: error
