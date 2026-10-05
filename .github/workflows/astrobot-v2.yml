@@ -33,8 +33,6 @@ jobs:
           git fetch upstream e317465d8a773b33482ad367ad2f856154c8bc6d
           git fetch upstream 8fa116eeb157964ea3b7aec1eed4d6e9d87e11de
           git fetch upstream 0bb2bdad17f69c3adc50934da88319826ae6adf5
-          git fetch upstream 0ce84e59b66f788108280d450ee7d66b834d0949
-          git fetch upstream 96011cc5c96d9d8390b2aa3413d3686dc5519372
 
           git cherry-pick pr838
           if ($LASTEXITCODE -ne 0) { throw "Cherry-pick #838 failed" }
@@ -75,12 +73,10 @@ jobs:
 
           # The depth/colour attachment mismatch correction is ported onto #985 below.
 
-          # Performance commits not already in #985 ancestry.
+          # Performance commits that cherry-pick cleanly onto the #985/#780 hybrid.
           foreach ($commit in @(
             "8fa116eeb157964ea3b7aec1eed4d6e9d87e11de",
-            "0bb2bdad17f69c3adc50934da88319826ae6adf5",
-            "0ce84e59b66f788108280d450ee7d66b834d0949",
-            "96011cc5c96d9d8390b2aa3413d3686dc5519372"
+            "0bb2bdad17f69c3adc50934da88319826ae6adf5"
           )) {
             git cherry-pick $commit
             if ($LASTEXITCODE -ne 0) {
@@ -89,6 +85,9 @@ jobs:
               throw "Performance cherry-pick failed at $commit"
             }
           }
+
+          # 0ce84e5 and 96011cc have tiny production changes but their test files conflict
+          # with #780; the production changes are ported directly in a later step.
 
           # #988's current head rewrites the newer pipeline-cache architecture and is not
           # directly cherry-pickable onto #780. #982 remains enabled for persistent Vulkan cache.
@@ -100,6 +99,65 @@ jobs:
           }
 
           git log -15 --oneline
+
+      - name: Port remaining low-risk performance fixes
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+
+          # 0ce84e5: do not read back a 512 KiB window when the CPU only requested a
+          # smaller dirty range. This avoids unnecessary GPU->CPU transfers.
+          p = Path("src/graphics/host_gpu/renderer/cache/bufferCache.cpp")
+          s = p.read_text(encoding="utf-8")
+          old = """\t\t// Widen nearby CPU reads so they share one GPU drain.
+          \t\tconstexpr uint64_t WindowSize   = 512 * 1024;
+          \t\tconst auto         buffer_begin = buffer.CpuAddress();
+          \t\tconst auto         buffer_end   = buffer_begin + buffer.Size();
+          \t\tconst auto window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
+          \t\tconst auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+
+          \t\tif (DownloadBufferMemory<false>(buffer, window_begin, window_end - window_begin)) {
+          \t\t\tm_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
+          \t\t}"""
+          new = """\t\tif (DownloadBufferMemory<false>(buffer, vaddr, size)) {
+          \t\t\tm_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+          \t\t}"""
+          if old in s:
+              s = s.replace(old, new, 1)
+          elif new not in s:
+              raise RuntimeError("0ce84e5 production pattern not found")
+          p.write_text(s, encoding="utf-8")
+
+          # 96011cc: equivalent separate-alpha equations can reuse the broadcast-alpha
+          # shader/pipeline instead of generating another pipeline variant.
+          p = Path("src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp")
+          s = p.read_text(encoding="utf-8")
+          old = """\t\t\t\tcase ShaderAlphaBlendSource::SourceAlpha:
+          \t\t\t\t\tblend.color_srcblend  = RemapSourceAlphaFactor(blend.color_srcblend);
+          \t\t\t\t\tblend.color_destblend = RemapSourceAlphaFactor(blend.color_destblend);
+          \t\t\t\t\tif (blend.separate_alpha_blend) {
+          \t\t\t\t\t\tblend.alpha_srcblend  = RemapSourceAlphaFactor(blend.alpha_srcblend);
+          \t\t\t\t\t\tblend.alpha_destblend = RemapSourceAlphaFactor(blend.alpha_destblend);
+          \t\t\t\t\t}
+          \t\t\t\t\tbreak;"""
+          new = """\t\t\t\tcase ShaderAlphaBlendSource::SourceAlpha:
+          \t\t\t\t\tblend.color_srcblend  = RemapSourceAlphaFactor(blend.color_srcblend);
+          \t\t\t\t\tblend.color_destblend = RemapSourceAlphaFactor(blend.color_destblend);
+          \t\t\t\t\tblend.separate_alpha_blend = false;
+          \t\t\t\t\tbreak;"""
+          if old in s:
+              s = s.replace(old, new, 1)
+          elif new not in s:
+              raise RuntimeError("96011cc production pattern not found")
+          p.write_text(s, encoding="utf-8")
+          '@ | Set-Content -Encoding UTF8 .port_perf_tail.py
+
+          python .port_perf_tail.py
+          if ($LASTEXITCODE -ne 0) { throw "Failed to port remaining performance fixes" }
+          Remove-Item .port_perf_tail.py
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw "Performance port has whitespace errors" }
 
       - name: Port latest AudioOut clock fix (#966)
         shell: pwsh
