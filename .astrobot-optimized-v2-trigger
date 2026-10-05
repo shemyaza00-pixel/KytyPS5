@@ -1,0 +1,13 @@
+Trigger Astro Bot Optimized V2 build.
+Retry with direct #966 audio port.
+Retry with streamed-mip port and without incompatible PR558 emitter cherry-pick.
+Retry without incompatible #988 cache port.
+Retry robust streamed-mip patch.
+Retry with rendering and perf ports.
+Retry with clean mip port only.
+Retry with manual depth-target port.
+Retry with manual tail perf ports.
+Retry resilient perf ports.
+Retry core V2 without incompatible tail micro-ports.
+Retry with scoped streamed-mip loop fix.
+Retry after completing #966 QueueSdlAudio port.
