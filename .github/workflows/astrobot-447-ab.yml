@@ -53,10 +53,8 @@ jobs:
         shell: pwsh
         run: |
           git fetch origin refs/pull/985/head:pr985
-          git fetch origin refs/pull/900/head:pr900
           git fetch origin refs/pull/982/head:pr982
           git fetch origin e317465d8a773b33482ad367ad2f856154c8bc6d
-          git fetch origin 539c0f7bf82704c5d3e52026d3f8c516631a093c
 
           # #985: only the PR-specific commits, not the intervening 10/02 mainline commits.
           $commits985 = @(git rev-list --reverse e317465d8a773b33482ad367ad2f856154c8bc6d..pr985)
@@ -79,28 +77,61 @@ jobs:
             }
           }
 
-          # #900: one experimental RELEASE_MEM batching commit. If launcher-side files conflict,
-          # keep 447's launcher and apply the production PM4 file from the PR.
-          $commits900 = @(git rev-list --reverse 539c0f7bf82704c5d3e52026d3f8c516631a093c..pr900)
-          Write-Host "#900 commits: $($commits900 -join ', ')"
-          foreach ($commit in $commits900) {
-            git cherry-pick $commit
-            if ($LASTEXITCODE -ne 0) {
-              $unmerged = @(git diff --name-only --diff-filter=U)
-              $production_conflicts = @($unmerged | Where-Object { $_ -notlike "src/launcher/*" })
-              if ($unmerged.Count -gt 0 -and $production_conflicts.Count -eq 0) {
-                foreach ($file in $unmerged) {
-                  git checkout --ours -- $file
-                  git add $file
-                }
-                git -c core.editor=true cherry-pick --continue
-              }
-              if ($LASTEXITCODE -ne 0) {
-                git status --short
-                throw "PR #900 failed: $commit"
-              }
-            }
+          # #900 production port only. The 447 checkpoint has diverged launcher/PM4 context,
+          # so apply the runtime change directly and keep launcher files untouched.
+          @'
+          from pathlib import Path
+
+          p = Path("src/graphics/guest_gpu/command_processor/pm4Handlers.cpp")
+          s = p.read_text(encoding="utf-8")
+
+          def once(old, new, label):
+              global s
+              if old not in s:
+                  raise RuntimeError(f"{label}: source text not found")
+              s = s.replace(old, new, 1)
+
+          if "DeferInterruptOnlyReleaseMemFlushes" not in s:
+              once("#include <cstdio>\n#include <cstring>",
+                   "#include <cstdio>\n#include <cstdlib>\n#include <cstring>",
+                   "#900 include")
+              once(
+                  "namespace {\n\nconstexpr uint32_t GcrGl2MetadataInvalidate",
+                  """namespace {
+
+          bool DeferInterruptOnlyReleaseMemFlushes() {
+              static const bool enabled = [] {
+                  const auto* value = std::getenv("KYTY_DEFER_RELEASE_MEM_INTERRUPTS");
+                  return value != nullptr && value[0] != '\\0' && std::strcmp(value, "0") != 0;
+              }();
+              return enabled;
           }
+
+          constexpr uint32_t GcrGl2MetadataInvalidate""",
+                  "#900 helper",
+              )
+              once(
+                  """\t\t\tcase 0x01:
+          \t\t\tcase 0x02:
+          \t\t\tcase 0x04:
+          \t\t\t\tcp.TriggerEopEventAtEndOfPipe(interrupt_context_id);
+          \t\t\t\tcp.BufferFlush();
+          \t\t\t\tbreak;""",
+                  """\t\t\tcase 0x01:
+          \t\t\tcase 0x02:
+          \t\t\tcase 0x04:
+          \t\t\t\tcp.TriggerEopEventAtEndOfPipe(interrupt_context_id);
+          \t\t\t\tif (!DeferInterruptOnlyReleaseMemFlushes()) {
+          \t\t\t\t\tcp.BufferFlush();
+          \t\t\t\t}
+          \t\t\t\tbreak;""",
+                  "#900 RELEASE_MEM",
+              )
+              p.write_text(s, encoding="utf-8")
+          '@ | Set-Content -Encoding UTF8 .port_900_447.py
+          python .port_900_447.py
+          if ($LASTEXITCODE -ne 0) { throw "Direct #900 port failed" }
+          Remove-Item .port_900_447.py
 
           # #982: PR-specific cache versioning commit only.
           $commits982 = @(git rev-list --reverse e317465d8a773b33482ad367ad2f856154c8bc6d..pr982)
