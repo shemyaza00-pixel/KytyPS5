@@ -174,6 +174,21 @@ jobs:
               "queue precheck",
           )
 
+          # #966 removes the old per-call last_output_time pacing from QueueSdlAudio;
+          # OutputClock in AudioOutOutputs owns pacing now.
+          old_queue_pacing = """\t\tif (port->queue_primed) {
+          \t\t\tconst auto next_time = port->last_output_time + buffer_us;
+          \t\t\tconst auto now       = LibKernel::KernelGetProcessTime();
+          \t\t\tif (next_time > now) {
+          \t\t\t\tCommon::Thread::SleepMicro(next_time - now);
+          \t\t\t}
+          \t\t}
+          """
+          if old_queue_pacing in s:
+              s = s.replace(old_queue_pacing, "", 1)
+          elif "port->last_output_time" in s:
+              raise RuntimeError("unexpected last_output_time reference remains in QueueSdlAudio")
+
           once(
               """\tif (!SDL_PutAudioStreamData(port->stream, prepared_data, static_cast<int>(prepared_size))) {
           \t\tLOGF("AudioOut: SDL_PutAudioStreamData failed: %s\\n", SDL_GetError());
