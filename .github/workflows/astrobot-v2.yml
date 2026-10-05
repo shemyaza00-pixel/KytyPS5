@@ -31,7 +31,6 @@ jobs:
           git fetch upstream 8c4224908b758abd91cf3a3f36fbe1be1b2f5e0a
           git fetch upstream refs/pull/985/head:pr985
           git fetch upstream e317465d8a773b33482ad367ad2f856154c8bc6d
-          git fetch upstream d9f34f90caafe810e2caedde6a9ac9673a5b208d
           git fetch upstream 37c8482d4ed87bf8a3540217d0ec42f50ef7a4d1
           git fetch upstream 8fa116eeb157964ea3b7aec1eed4d6e9d87e11de
           git fetch upstream 0bb2bdad17f69c3adc50934da88319826ae6adf5
@@ -72,14 +71,8 @@ jobs:
           # The old PR #558 DPP-helper patch targets a different ballot implementation; #985
           # no longer masks helper invocations in that path, so applying it would be wrong.
 
-          # Astro-specific streamed mip residency fix. This directly targets the type of
-          # texture corruption seen in gameplay.
-          git cherry-pick d9f34f90caafe810e2caedde6a9ac9673a5b208d
-          if ($LASTEXITCODE -ne 0) {
-            $unmerged = @(git diff --name-only --diff-filter=U)
-            $unmerged | ForEach-Object { Write-Host "Unresolved streamed-mip fix: $_" }
-            throw "Streamed-mip rendering fix failed"
-          }
+          # The streamed-mip correction is ported in a dedicated step below instead of
+          # cherry-picking the PR #558 commit, which contains diagnostics and branch-specific code.
 
           # Fix mismatched depth/colour attachment extents observed in Astro.
           git cherry-pick 37c8482d4ed87bf8a3540217d0ec42f50ef7a4d1
