@@ -34,9 +34,8 @@ jobs:
           git fetch origin 8c4224908b758abd91cf3a3f36fbe1be1b2f5e0a
           git fetch origin refs/pull/985/head:pr985
           git fetch origin e317465d8a773b33482ad367ad2f856154c8bc6d
-          git fetch origin refs/pull/491/head:pr491
-          git fetch origin 74a78f37d08fabae0a37e621ef209786796c37fe
           git fetch origin refs/pull/988/head:pr988
+          git fetch origin d9f34f90caafe810e2caedde6a9ac9673a5b208d
 
       - name: Apply tuned447 compatibility and shader-loop fixes
         shell: pwsh
@@ -114,27 +113,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "#900 runtime port failed" }
           Remove-Item .port900.py
 
-      - name: Apply depth comparison graphics fix
+      - name: Apply Astro streamed-texture residency fix
         shell: pwsh
         run: |
-          $commits491 = @(git rev-list --reverse 74a78f37d08fabae0a37e621ef209786796c37fe..pr491)
-          Write-Host "#491 commits: $($commits491 -join ', ')"
-          foreach ($commit in $commits491) {
-            git cherry-pick $commit
-            if ($LASTEXITCODE -ne 0) {
-              $unmerged = @(git diff --name-only --diff-filter=U)
-              if ($unmerged.Count -gt 0 -and ($unmerged | Where-Object { $_ -notlike "tests/*" }).Count -eq 0) {
-                foreach ($file in $unmerged) {
-                  git checkout --theirs -- $file
-                  git add $file
-                }
-                git -c core.editor=true cherry-pick --continue
-              }
-              if ($LASTEXITCODE -ne 0) {
-                $unmerged | ForEach-Object { Write-Host "Unresolved #491: $_" }
-                throw "#491 failed at $commit"
-              }
-            }
+          git cherry-pick d9f34f90caafe810e2caedde6a9ac9673a5b208d
+          $rc = $LASTEXITCODE
+          if ($rc -ne 0) {
+            git status --short
+            $unmerged = @(git diff --name-only --diff-filter=U)
+            $unmerged | ForEach-Object { Write-Host "Unresolved Astro mip fix: $_" }
+            throw "Astro streamed-mip fix failed"
           }
 
       - name: Apply shader disk cache PR 988
@@ -144,82 +132,35 @@ jobs:
           Write-Host "#988 commits: $($commits988 -join ', ')"
           foreach ($commit in $commits988) {
             git cherry-pick $commit
-            if ($LASTEXITCODE -ne 0) {
+            $rc = $LASTEXITCODE
+            if ($rc -ne 0) {
               $unmerged = @(git diff --name-only --diff-filter=U)
-              if ($unmerged.Count -gt 0 -and ($unmerged | Where-Object { $_ -notlike "tests/*" }).Count -eq 0) {
+              $nonTests = @($unmerged | Where-Object { $_ -notlike "tests/*" })
+              if ($unmerged.Count -gt 0 -and $nonTests.Count -eq 0) {
                 foreach ($file in $unmerged) {
                   git checkout --theirs -- $file
                   git add $file
                 }
                 git -c core.editor=true cherry-pick --continue
+                $rc = $LASTEXITCODE
               }
-              if ($LASTEXITCODE -ne 0) {
-                $unmerged | ForEach-Object { Write-Host "Unresolved #988: $_" }
+              if ($rc -ne 0) {
+                git status --short
                 throw "#988 failed at $commit"
               }
             }
           }
 
-      - name: Make 988 compatible with manual depth specialization and persistent Vulkan cache
+      - name: Keep persistent Vulkan pipeline cache semantics
         shell: pwsh
         run: |
           @'
           from pathlib import Path
 
-          # Our graphics fix extends the sampler/image specialization. Include those values
-          # in the disk-cache serialization/key so a warm run cannot reuse the wrong compare mode.
-          cache = Path("src/graphics/shader/recompiler/ShaderDiskCache.cpp")
-          s = cache.read_text(encoding="utf-8")
-          if "Serialize(ar, v.depth_compare_func);" not in s:
-              old = """\tSerialize(ar, v.force_point_filtering);
-          \tSerialize(ar, v.depth_compare);
-          \tSerialize(ar, v.integer_border);"""
-              new = """\tSerialize(ar, v.force_point_filtering);
-          \tSerialize(ar, v.depth_compare);
-          \tSerialize(ar, v.depth_compare_func);
-          \tSerialize(ar, v.integer_border);"""
-              if old not in s:
-                  raise RuntimeError("ShaderDiskCache SamplerResource layout not found")
-              s = s.replace(old, new, 1)
-          # Bump our local format because the serialized plan differs from upstream #988.
-          s = s.replace("inline constexpr uint32_t kFormatVersion = 1;", "inline constexpr uint32_t kFormatVersion = 2;")
-          cache.write_text(s, encoding="utf-8")
-
-          h = Path("src/graphics/shader/recompiler/ShaderDiskCache.h")
-          hs = h.read_text(encoding="utf-8")
-          hs = hs.replace("inline constexpr uint32_t kFormatVersion = 1;", "inline constexpr uint32_t kFormatVersion = 2;")
-          h.write_text(hs, encoding="utf-8")
-
           pc = Path("src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp")
           p = pc.read_text(encoding="utf-8")
-          image_anchor = """\t\t\tkey.Add(image.cube);
-          \t\t\tkey.Add(image.fmask);"""
-          if "image.needs_manual_depth_compare" not in p:
-              if image_anchor not in p:
-                  raise RuntimeError("PermutationKey image anchor not found")
-              p = p.replace(image_anchor, """\t\t\tkey.Add(image.cube);
-          \t\t\tkey.Add(image.fmask);
-          \t\t\tkey.Add(image.needs_manual_depth_compare);""", 1)
-          if "spec.sampler_depth_compare_funcs" not in p:
-              marker = """\t\t}
-          \t\treturn key.Finish();
-          \t}
 
-          \ttemplate <typename InputInfo>"""
-              replacement = """\t\t}
-          \t\tkey.Add(static_cast<uint64_t>(spec.sampler_depth_compare_funcs.size()));
-          \t\tfor (const auto compare: spec.sampler_depth_compare_funcs) {
-          \t\t\tkey.Add(compare);
-          \t\t}
-          \t\treturn key.Finish();
-          \t}
-
-          \ttemplate <typename InputInfo>"""
-              if marker not in p:
-                  raise RuntimeError("PermutationKey tail not found")
-              p = p.replace(marker, replacement, 1)
-
-          # PR #982 semantics, kept alongside #988's KYTY_RECOMPILER_SIGNATURE include.
+          # PR #982 semantics: keep driver pipeline cache across custom emulator revisions.
           if "kPipelineCacheFormat" not in p:
               anchor = "std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {"
               if anchor not in p:
@@ -227,26 +168,30 @@ jobs:
               p = p.replace(anchor, """constexpr uint32_t kPipelineCacheFormat = 2;
 
           std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {""", 1)
-          old_sig = 'return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\\n", KYTY_GIT_REVISION,'
-          if old_sig in p:
-              p = p.replace(old_sig,
-                  'return fmt::format("KytyPC2:{}:{:08x}:{:08x}:{:08x}:{}\\n", kPipelineCacheFormat,', 1)
-          # Remove only the revision/dirty gate; #988 still needs kytyGitVersion.h for its signature.
+
+          if "KytyPC1:" in p:
+              old = 'return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\\n", KYTY_GIT_REVISION,'
+              new = 'return fmt::format("KytyPC2:{}:{:08x}:{:08x}:{:08x}:{}\\n", kPipelineCacheFormat,'
+              if old not in p:
+                  raise RuntimeError("old pipeline signature not found")
+              p = p.replace(old, new, 1)
+
           gate_start = p.find("\tconst std::string_view git_hash     = KYTY_GIT_HASH;")
           if gate_start >= 0:
-              gate_end = p.find("\n\tconst auto properties", gate_start)
+              gate_end = p.find("\n\tm_driver_cache_path", gate_start)
               if gate_end < 0:
                   raise RuntimeError("pipeline revision gate end not found")
               p = p[:gate_start] + p[gate_end+1:]
+
           p = p.replace("driver, emulator, or data mismatch", "driver, format, or data mismatch")
           pc.write_text(p, encoding="utf-8")
-          '@ | Set-Content -Encoding UTF8 .cache_compat.py
+          '@ | Set-Content -Encoding UTF8 .port982_after988.py
 
-          python .cache_compat.py
-          if ($LASTEXITCODE -ne 0) { throw "cache compatibility port failed" }
-          Remove-Item .cache_compat.py
+          python .port982_after988.py
+          if ($LASTEXITCODE -ne 0) { throw "#982 semantics port failed" }
+          Remove-Item .port982_after988.py
           git diff --check
-          if ($LASTEXITCODE -ne 0) { throw "cache compatibility whitespace check failed" }
+          if ($LASTEXITCODE -ne 0) { throw "cache port whitespace check failed" }
 
       - name: Apply conservative performance patches
         if: matrix.variant == 'gfxperf447'
@@ -419,13 +364,13 @@ jobs:
           Variant: ${{ matrix.variant }}
           Base: official 4479808
           Common: #838 + compatible #839 + #985 + #900 + #982 semantics
-          Graphics: PR #491 manual depth comparison / depth-view fixes
-          Shader reuse: PR #988 disk cache, locally keyed for the #491 specialization
+          Graphics: Astro-specific streamed-texture residency fix (d9f34f9)
+          Shader reuse: PR #988 disk cache
           Custom A/V sync: NOT included
           Manual streamed-mip/depth-target V2 hacks: NOT included
 
           gfxperf447 additionally carries conservative renderer hot-path commits,
-          AVX2 code generation for the user's i7-7700, and removes inactive Tracy hot-path zones.
+          AVX2 code generation for the i7-7700, and removes inactive Tracy hot-path zones.
           "@ | Set-Content -Encoding UTF8 "$install\README-ASTROBOT-GFXPERF.txt"
 
       - name: Verify
