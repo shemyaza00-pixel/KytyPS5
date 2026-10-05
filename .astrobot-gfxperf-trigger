@@ -1,1 +1,2 @@
 Trigger Astro Bot graphics/cache/performance experiment.
+Retry with Astro streamed-mip + #988 and strict conflict handling.
