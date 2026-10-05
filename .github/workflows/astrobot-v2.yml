@@ -32,9 +32,6 @@ jobs:
           git fetch upstream refs/pull/985/head:pr985
           git fetch upstream refs/pull/988/head:pr988
           git fetch upstream e317465d8a773b33482ad367ad2f856154c8bc6d
-          git fetch upstream 7855c980cb85cb916d47ad2e74ea14a311252e23
-          git fetch upstream e0b682e4b2cc08b127765333123aeeaa3d092fdb
-          git fetch upstream 70a475ec8cd08575a41b31d234578e9c3e672dfa
           git fetch upstream fcf0f3b67e3b92b2a89bea97fa0a1b85ebeff6e8
           git fetch upstream a5b874e96e131b7926107b054e10b7464e8f321b
           git fetch upstream d9f34f90caafe810e2caedde6a9ac9673a5b208d
@@ -65,19 +62,9 @@ jobs:
             }
           }
 
-          # Official post-base audio timing fixes.
-          foreach ($commit in @(
-            "7855c980cb85cb916d47ad2e74ea14a311252e23",
-            "e0b682e4b2cc08b127765333123aeeaa3d092fdb",
-            "70a475ec8cd08575a41b31d234578e9c3e672dfa"
-          )) {
-            git cherry-pick $commit
-            if ($LASTEXITCODE -ne 0) {
-              $unmerged = @(git diff --name-only --diff-filter=U)
-              $unmerged | ForEach-Object { Write-Host "Unresolved audio: $_" }
-              throw "Audio cherry-pick failed at $commit"
-            }
-          }
+          # The #780 integration branch already carries the #822 cadence work and the
+          # #848 shared AvPlayer audio-master clock. #966 is ported below because its
+          # newer audio.cpp also contains unrelated controller changes.
 
           # Astro-specific WQM/live-predicate correction.
           git cherry-pick fcf0f3b67e3b92b2a89bea97fa0a1b85ebeff6e8
@@ -134,6 +121,188 @@ jobs:
           }
 
           git log -15 --oneline
+
+      - name: Port latest AudioOut clock fix (#966)
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+
+          p = Path("src/libs/audio.cpp")
+          s = p.read_text(encoding="utf-8")
+
+          def once(old, new, label):
+              global s
+              if old not in s:
+                  raise RuntimeError(f"{label}: source text not found")
+              s = s.replace(old, new, 1)
+
+          if "#include <array>" not in s:
+              once("#include <algorithm>\n", "#include <algorithm>\n#include <array>\n", "array include")
+
+          if "struct OutputClock" not in s:
+              once(
+                  "constexpr uint32_t AUDIO_IN_GRAIN_MAX_ASYNC          = 384;\n",
+                  """constexpr uint32_t AUDIO_IN_GRAIN_MAX_ASYNC          = 384;
+
+          struct OutputClock {
+              uint64_t next_time = 0;
+              uint64_t remainder = 0;
+
+              uint64_t Advance(uint64_t now, uint32_t frames, uint32_t rate) {
+                  if (next_time == 0 || (now > next_time && now - next_time > 100000)) {
+                      next_time = now;
+                      remainder = 0;
+                  }
+                  const auto deadline = next_time;
+                  const auto duration = 1000000ULL * frames + remainder;
+                  next_time += duration / rate;
+                  remainder = duration % rate;
+                  return deadline;
+              }
+          };
+          """,
+                  "OutputClock",
+              )
+
+          once(
+              """\t\tbool     used             = false;
+          \t\tint      type             = 0;
+          \t\tuint32_t samples_num      = 0;
+          \t\tuint32_t freq             = 0;
+          \t\tFormat   format           = Format::Unknown;
+          \t\tuint64_t last_output_time = 0;
+          \t\tbool     queue_primed     = false;
+          \t\tint      channels_num     = 0;""",
+              """\t\tbool        used         = false;
+          \t\tint         type         = 0;
+          \t\tuint32_t    samples_num  = 0;
+          \t\tuint32_t    freq         = 0;
+          \t\tFormat      format       = Format::Unknown;
+          \t\tOutputClock clock;
+          \t\tbool        queue_primed = false;
+          \t\tint         channels_num = 0;""",
+              "PortOut clock",
+          )
+
+          once(
+              """\t\tauto queued                = SDL_GetAudioStreamQueued(port->stream);
+          \t\tif (queued < static_cast<int>(prepared_size)) {
+          \t\t\tport->queue_primed = false;
+          \t\t}
+          \t\twhile (queued > static_cast<int>(min_queued_size)) {""",
+              """\t\tauto queued                = SDL_GetAudioStreamQueued(port->stream);
+          \t\twhile (queued > static_cast<int>(min_queued_size)) {""",
+              "queue precheck",
+          )
+
+          once(
+              """\tif (!SDL_PutAudioStreamData(port->stream, prepared_data, static_cast<int>(prepared_size))) {
+          \t\tLOGF("AudioOut: SDL_PutAudioStreamData failed: %s\\n", SDL_GetError());
+          \t\treturn false;
+          \t}
+          \tif (blocking && !port->queue_primed &&
+          \t    SDL_GetAudioStreamQueued(port->stream) >= static_cast<int>(min_queued_size)) {
+          \t\tport->queue_primed = true;
+          \t}""",
+              """\tif (!SDL_PutAudioStreamData(port->stream, prepared_data, static_cast<int>(prepared_size))) {
+          \t\tLOGF("AudioOut: SDL_PutAudioStreamData failed: %s\\n", SDL_GetError());
+          \t\tport->queue_primed = false;
+          \t\treturn false;
+          \t}
+          \tif (!port->queue_primed) {
+          \t\tport->clock = {};
+          \t}
+          \tif (blocking && !port->queue_primed &&
+          \t    SDL_GetAudioStreamQueued(port->stream) >= static_cast<int>(min_queued_size)) {
+          \t\tport->queue_primed = true;
+          \t}""",
+              "queue clock reset",
+          )
+
+          once(
+              """\t\t\tport.used             = true;
+          \t\t\tport.type             = type;
+          \t\t\tport.samples_num      = samples_num;
+          \t\t\tport.freq             = freq;
+          \t\t\tport.format           = format;
+          \t\t\tport.last_output_time = 0;""",
+              """\t\t\tport.used        = true;
+          \t\t\tport.type        = type;
+          \t\t\tport.samples_num = samples_num;
+          \t\t\tport.freq        = freq;
+          \t\t\tport.format      = format;""",
+              "open clock",
+          )
+
+          start = s.index("uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking) {")
+          end = s.index("\nstatic bool RecordingDevicePresent", start)
+          replacement = """uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking) {
+          \tEXIT_NOT_IMPLEMENTED(num == 0 || num > OUT_PORTS_MAX);
+          \tEXIT_NOT_IMPLEMENTED(!AudioOutValid(params[0].handle));
+
+          \tconst auto&                     first_port = m_out_ports[params[0].handle.GetId()];
+          \tstd::array<bool, OUT_PORTS_MAX> paced {};
+          \tbool                            any_device = false;
+          \tuint64_t                        deadline   = 0;
+
+          \tfor (uint32_t i = 0; i < num; i++) {
+          \t\tauto& port = m_out_ports[params[i].handle.GetId()];
+
+          \t\tuint64_t controller_queued_us = 0;
+          \t\tif (port.haptics != nullptr) {
+          \t\t\tCommon::LockGuard lock(m_mutex);
+          \t\t\tcontroller_queued_us = Controller::DualSenseHaptics::Queue(
+          \t\t\t    port.haptics, Controller::GetActiveControllerId(), params[i].data,
+          \t\t\t    port.samples_num, static_cast<uint32_t>(port.channels_num),
+          \t\t\t    FormatIsFloat(port.format), port.volume);
+          \t\t}
+          \t\tif (controller_queued_us == 0) {
+          \t\t\tif (QueueSdlAudio(&port, params[i].data, blocking)) {
+          \t\t\t\tany_device = true;
+          \t\t\t\tpaced[i]   = port.queue_primed;
+          \t\t\t}
+          \t\t} else {
+          \t\t\tport.queue_primed = false;
+          \t\t\tif (port.type == AUDIO_OUT_PORT_TYPE_PADSPK) {
+          \t\t\t\tany_device = true;
+          \t\t\t\tif (blocking && controller_queued_us > AUDIO_OUT_TARGET_LATENCY_US) {
+          \t\t\t\t\tdeadline = std::max(deadline, LibKernel::KernelGetProcessTime() +
+          \t\t\t\t\t                                   controller_queued_us -
+          \t\t\t\t\t                                   AUDIO_OUT_TARGET_LATENCY_US);
+          \t\t\t\t}
+          \t\t\t}
+          \t\t}
+          \t}
+
+          \tconst auto now = LibKernel::KernelGetProcessTime();
+          \tfor (uint32_t i = 0; i < num; i++) {
+          \t\tauto& port = m_out_ports[params[i].handle.GetId()];
+          \t\tif (blocking && (paced[i] || !any_device)) {
+          \t\t\tdeadline = std::max(deadline, port.clock.Advance(now, port.samples_num, port.freq));
+          \t\t} else {
+          \t\t\tport.clock = {};
+          \t\t}
+          \t\tif (!blocking) {
+          \t\t\tport.queue_primed = false;
+          \t\t}
+          \t}
+          \tif (deadline > now) {
+          \t\tCommon::Thread::SleepMicro(deadline - now);
+          \t}
+
+          \treturn first_port.samples_num;
+          }
+          """
+          s = s[:start] + replacement + s[end:]
+          p.write_text(s, encoding="utf-8")
+          '@ | Set-Content -Encoding UTF8 .port_audio966.py
+
+          python .port_audio966.py
+          if ($LASTEXITCODE -ne 0) { throw "Failed to port #966 audio timing" }
+          Remove-Item .port_audio966.py
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw "#966 port has whitespace errors" }
 
       - name: Apply batching and persistent Vulkan cache
         shell: pwsh
