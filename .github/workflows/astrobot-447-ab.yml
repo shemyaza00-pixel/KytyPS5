@@ -1,0 +1,258 @@
+name: Astro Bot 447 A-B Windows build
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline447, tuned447]
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout 2026-10-01 Astro checkpoint
+        uses: actions/checkout@v4
+        with:
+          repository: KytyPS5/KytyPS5
+          ref: 44798085bd26fd27078671789f5e8426aeb21521
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Apply Windows and Intel compatibility fixes
+        shell: pwsh
+        run: |
+          git config user.name "AstroBot CI"
+          git config user.email "actions@users.noreply.github.com"
+
+          git fetch origin refs/pull/838/head:pr838
+          git fetch origin 8c4224908b758abd91cf3a3f36fbe1be1b2f5e0a
+
+          git cherry-pick pr838
+          if ($LASTEXITCODE -ne 0) {
+            git status --short
+            throw "PR #838 failed on 4479808"
+          }
+
+          # This is the pre-merge #839 revision written for the redZonePatcher architecture
+          # still present in the 2026-10-01 checkpoint. It is the compatible Intel EXTRQ fix.
+          git cherry-pick 8c4224908b758abd91cf3a3f36fbe1be1b2f5e0a
+          if ($LASTEXITCODE -ne 0) {
+            git status --short
+            throw "Compatible #839 revision failed on 4479808"
+          }
+
+      - name: Apply tuned patches
+        if: matrix.variant == 'tuned447'
+        shell: pwsh
+        run: |
+          git fetch origin refs/pull/985/head:pr985
+          git fetch origin refs/pull/900/head:pr900
+          git fetch origin refs/pull/982/head:pr982
+          git fetch origin e317465d8a773b33482ad367ad2f856154c8bc6d
+          git fetch origin 539c0f7bf82704c5d3e52026d3f8c516631a093c
+
+          # #985: only the PR-specific commits, not the intervening 10/02 mainline commits.
+          $commits985 = @(git rev-list --reverse e317465d8a773b33482ad367ad2f856154c8bc6d..pr985)
+          Write-Host "#985 commits: $($commits985 -join ', ')"
+          foreach ($commit in $commits985) {
+            git cherry-pick $commit
+            if ($LASTEXITCODE -ne 0) {
+              $unmerged = @(git diff --name-only --diff-filter=U)
+              if ($unmerged.Count -gt 0 -and ($unmerged | Where-Object { $_ -notlike "tests/*" }).Count -eq 0) {
+                foreach ($file in $unmerged) {
+                  git checkout --theirs -- $file
+                  git add $file
+                }
+                git -c core.editor=true cherry-pick --continue
+              }
+              if ($LASTEXITCODE -ne 0) {
+                git status --short
+                throw "PR #985 specific commit failed: $commit"
+              }
+            }
+          }
+
+          # #900: one experimental RELEASE_MEM batching commit. If launcher-side files conflict,
+          # keep 447's launcher and apply the production PM4 file from the PR.
+          $commits900 = @(git rev-list --reverse 539c0f7bf82704c5d3e52026d3f8c516631a093c..pr900)
+          Write-Host "#900 commits: $($commits900 -join ', ')"
+          foreach ($commit in $commits900) {
+            git cherry-pick $commit
+            if ($LASTEXITCODE -ne 0) {
+              $unmerged = @(git diff --name-only --diff-filter=U)
+              $production_conflicts = @($unmerged | Where-Object { $_ -notlike "src/launcher/*" })
+              if ($unmerged.Count -gt 0 -and $production_conflicts.Count -eq 0) {
+                foreach ($file in $unmerged) {
+                  git checkout --ours -- $file
+                  git add $file
+                }
+                git -c core.editor=true cherry-pick --continue
+              }
+              if ($LASTEXITCODE -ne 0) {
+                git status --short
+                throw "PR #900 failed: $commit"
+              }
+            }
+          }
+
+          # #982: PR-specific cache versioning commit only.
+          $commits982 = @(git rev-list --reverse e317465d8a773b33482ad367ad2f856154c8bc6d..pr982)
+          Write-Host "#982 commits: $($commits982 -join ', ')"
+          foreach ($commit in $commits982) {
+            git cherry-pick $commit
+            if ($LASTEXITCODE -ne 0) {
+              git status --short
+              throw "PR #982 failed: $commit"
+            }
+          }
+
+          git log -12 --oneline
+
+      - name: Setup Visual Studio environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Locate vcpkg
+        id: vcpkg
+        shell: pwsh
+        run: |
+          $vcpkgRoot = Split-Path (Get-Command vcpkg).Source
+          "root=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Install glslang
+        shell: pwsh
+        run: |
+          vcpkg install glslang[tools,opt]:x64-windows
+          "${{ steps.vcpkg.outputs.root }}\installed\x64-windows\tools\glslang" |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install Qt 6.10.3
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.10.3"
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          cache: true
+
+      - name: Configure
+        shell: cmd
+        run: |
+          cmake -S . -B _Build\windows -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON ^
+            -DKYTY_BUILD_ORIGIN=Fork ^
+            -DKYTY_BUILD_REPOSITORY=shemyaza00-pixel/KytyPS5 ^
+            -DCMAKE_C_COMPILER=clang-cl ^
+            -DCMAKE_CXX_COMPILER=clang-cl ^
+            -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
+
+      - name: Build emulator and launcher
+        shell: cmd
+        run: |
+          cmake --build _Build\windows --target kyty_emulator launcher --parallel
+
+      - name: Install
+        shell: cmd
+        run: |
+          cmake --install _Build\windows --prefix _Build\windows\install
+
+      - name: Package Astro Bot files
+        shell: pwsh
+        run: |
+          $install = "_Build\windows\install"
+          New-Item -ItemType Directory -Force -Path "$install\_Patches" | Out-Null
+
+          @'
+          {
+            "id": "PPSA21564",
+            "name": "ASTRO BOT: non RT patch",
+            "version": "01.007.000",
+            "process": "eboot.bin",
+            "source_sha256": "70d673f7c43edb189461a60f076e15baa73f9a82a579603e44372ae5b7225d3d",
+            "mods": [
+              {
+                "name": "Select the existing non-tiled deferred-lighting renderer",
+                "enabled": true,
+                "memory": [
+                  {
+                    "offset": "0x73eb993",
+                    "off": "4584f60f84ed0800004531f64c8d3dea78a40141b430",
+                    "on": "4584f6e9ee080000904531f64c8d3dea78a40141b430"
+                  }
+                ]
+              },
+              {
+                "name": "Disable GI probes and lighting shaders",
+                "enabled": true,
+                "memory": [
+                  {
+                    "offset": "0x711d0b3",
+                    "off": "0fb682800700008887e4050000",
+                    "on": "b80000000090908887e4050000"
+                  }
+                ]
+              }
+            ]
+          }
+          '@ | Set-Content -Encoding UTF8 "$install\_Patches\PPSA21564.json"
+
+          if ("${{ matrix.variant }}" -eq "tuned447") {
+            @'
+          @echo off
+          cd /d "%~dp0"
+          set "KYTY_DEFER_RELEASE_MEM_INTERRUPTS=1"
+          kyty_emulator.exe --game "C:\Games\PS5 Games\PPSA21564-app" --game-patch "%~dp0_Patches\PPSA21564.json" --redzone --shader-optimization-type Performance
+          pause
+          '@ | Set-Content -Encoding ASCII "$install\RUN_ASTROBOT_TUNED_447.bat"
+
+            @'
+          Astro Bot checkpoint experiment - TUNED
+
+          Base: official 2026-10-01 commit 4479808
+          Compatibility: #838 + compatible pre-merge #839
+          Added: #985 + #900 + #982
+          No custom A/V sync.
+          No manual streamed-mip or depth-target ports.
+          Non-RT patch bundled.
+          '@ | Set-Content -Encoding UTF8 "$install\README-ASTROBOT-447.txt"
+          } else {
+            @'
+          @echo off
+          cd /d "%~dp0"
+          set "KYTY_DEFER_RELEASE_MEM_INTERRUPTS=0"
+          kyty_emulator.exe --game "C:\Games\PS5 Games\PPSA21564-app" --game-patch "%~dp0_Patches\PPSA21564.json" --redzone --shader-optimization-type Performance
+          pause
+          '@ | Set-Content -Encoding ASCII "$install\RUN_ASTROBOT_BASE_447.bat"
+
+            @'
+          Astro Bot checkpoint experiment - BASELINE
+
+          Base: official 2026-10-01 commit 4479808
+          Compatibility only: #838 + compatible pre-merge #839
+          No #985/#900/#982.
+          No custom A/V sync.
+          No manual streamed-mip or depth-target ports.
+          Non-RT patch bundled.
+          '@ | Set-Content -Encoding UTF8 "$install\README-ASTROBOT-447.txt"
+          }
+
+      - name: Verify package
+        shell: pwsh
+        run: |
+          if (!(Test-Path "_Build\windows\install\kyty_emulator.exe")) { throw "kyty_emulator.exe missing" }
+          if (!(Test-Path "_Build\windows\install\launcher.exe")) { throw "launcher.exe missing" }
+          Get-ChildItem "_Build\windows\install"
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-AstroBot-${{ matrix.variant }}-Windows-x64
+          path: _Build/windows/install/**
+          if-no-files-found: error
