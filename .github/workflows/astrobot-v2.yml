@@ -346,11 +346,22 @@ jobs:
                   "tile expected regions",
                   re.S,
               )
-              s = s.replace(
+              # Only change the mip loop inside TextureBuildGpuTileInfos. A global
+              # replacement would accidentally touch TextureBuildImageCopies first.
+              copies_start = s.index("std::vector<vk::BufferImageCopy> TextureBuildImageCopies")
+              tile_start = s.index("bool TextureBuildGpuTileInfos", copies_start)
+              copies = s[copies_start:tile_start].replace(
+                  "for (uint32_t mip_level = base_level; mip_level < description.levels; ++mip_level) {",
+                  "for (uint32_t mip_level = 0; mip_level < description.levels; ++mip_level) {",
+                  1,
+              )
+              tail = s[tile_start:]
+              tail = tail.replace(
                   "for (uint32_t mip_level = 0; mip_level < levels; ++mip_level) {",
                   "for (uint32_t mip_level = base_level; mip_level < levels; ++mip_level) {",
                   1,
               )
+              s = s[:copies_start] + copies + tail
               save(path, s)
 
           # TextureCache: omit nonresident mips during upload and add a BC7 fallback detector.
