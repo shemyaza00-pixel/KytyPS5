@@ -105,52 +105,52 @@ jobs:
         run: |
           @'
           from pathlib import Path
+          import re
 
-          # 0ce84e5: do not read back a 512 KiB window when the CPU only requested a
-          # smaller dirty range. This avoids unnecessary GPU->CPU transfers.
+          # 0ce84e5: limit a CPU-triggered GPU readback to the requested range instead
+          # of widening it to a 512 KiB window.
           p = Path("src/graphics/host_gpu/renderer/cache/bufferCache.cpp")
           s = p.read_text(encoding="utf-8")
-          old = """\t\t// Widen nearby CPU reads so they share one GPU drain.
-          \t\tconstexpr uint64_t WindowSize   = 512 * 1024;
-          \t\tconst auto         buffer_begin = buffer.CpuAddress();
-          \t\tconst auto         buffer_end   = buffer_begin + buffer.Size();
-          \t\tconst auto window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
-          \t\tconst auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+          if "DownloadBufferMemory<false>(buffer, vaddr, size)" not in s:
+              pattern = re.compile(
+                  r"\t\t// Widen nearby CPU reads so they share one GPU drain\.\n"
+                  r"\t\tconstexpr uint64_t WindowSize\s*= 512 \* 1024;\n"
+                  r"\t\tconst auto\s+buffer_begin = buffer\.CpuAddress\(\);\n"
+                  r"\t\tconst auto\s+buffer_end\s*= buffer_begin \+ buffer\.Size\(\);\n"
+                  r"\t\tconst auto window_begin = std::max\(Common::AlignDown\(vaddr, WindowSize\), buffer_begin\);\n"
+                  r"\t\tconst auto window_end = std::min\(std::max\(window_begin \+ WindowSize, vaddr \+ size\), buffer_end\);\n\n"
+                  r"\t\tif \(DownloadBufferMemory<false>\(buffer, window_begin, window_end - window_begin\)\) \{\n"
+                  r"\t\t\tm_memory_tracker\.UnmarkRegionAsGpuModified\(window_begin, window_end - window_begin\);\n"
+                  r"\t\t\}"
+              )
+              replacement = (
+                  "\t\tif (DownloadBufferMemory<false>(buffer, vaddr, size)) {\n"
+                  "\t\t\tm_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);\n"
+                  "\t\t}"
+              )
+              s, n = pattern.subn(replacement, s, count=1)
+              if n != 1:
+                  raise RuntimeError("0ce84e5 production pattern not found")
+              p.write_text(s, encoding="utf-8")
 
-          \t\tif (DownloadBufferMemory<false>(buffer, window_begin, window_end - window_begin)) {
-          \t\t\tm_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
-          \t\t}"""
-          new = """\t\tif (DownloadBufferMemory<false>(buffer, vaddr, size)) {
-          \t\t\tm_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
-          \t\t}"""
-          if old in s:
-              s = s.replace(old, new, 1)
-          elif new not in s:
-              raise RuntimeError("0ce84e5 production pattern not found")
-          p.write_text(s, encoding="utf-8")
-
-          # 96011cc: equivalent separate-alpha equations can reuse the broadcast-alpha
-          # shader/pipeline instead of generating another pipeline variant.
+          # 96011cc: equivalent separate-alpha state can reuse the broadcast-alpha
+          # shader/pipeline variant.
           p = Path("src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp")
           s = p.read_text(encoding="utf-8")
-          old = """\t\t\t\tcase ShaderAlphaBlendSource::SourceAlpha:
-          \t\t\t\t\tblend.color_srcblend  = RemapSourceAlphaFactor(blend.color_srcblend);
-          \t\t\t\t\tblend.color_destblend = RemapSourceAlphaFactor(blend.color_destblend);
-          \t\t\t\t\tif (blend.separate_alpha_blend) {
-          \t\t\t\t\t\tblend.alpha_srcblend  = RemapSourceAlphaFactor(blend.alpha_srcblend);
-          \t\t\t\t\t\tblend.alpha_destblend = RemapSourceAlphaFactor(blend.alpha_destblend);
-          \t\t\t\t\t}
-          \t\t\t\t\tbreak;"""
-          new = """\t\t\t\tcase ShaderAlphaBlendSource::SourceAlpha:
-          \t\t\t\t\tblend.color_srcblend  = RemapSourceAlphaFactor(blend.color_srcblend);
-          \t\t\t\t\tblend.color_destblend = RemapSourceAlphaFactor(blend.color_destblend);
-          \t\t\t\t\tblend.separate_alpha_blend = false;
-          \t\t\t\t\tbreak;"""
-          if old in s:
-              s = s.replace(old, new, 1)
-          elif new not in s:
-              raise RuntimeError("96011cc production pattern not found")
-          p.write_text(s, encoding="utf-8")
+          if "blend.separate_alpha_blend = false;" not in s:
+              pattern = re.compile(
+                  r"(\t+case ShaderAlphaBlendSource::SourceAlpha:\n"
+                  r"\t+blend\.color_srcblend\s*= RemapSourceAlphaFactor\(blend\.color_srcblend\);\n"
+                  r"\t+blend\.color_destblend = RemapSourceAlphaFactor\(blend\.color_destblend\);\n)"
+                  r"\t+if \(blend\.separate_alpha_blend\) \{\n"
+                  r"\t+blend\.alpha_srcblend\s*= RemapSourceAlphaFactor\(blend\.alpha_srcblend\);\n"
+                  r"\t+blend\.alpha_destblend = RemapSourceAlphaFactor\(blend\.alpha_destblend\);\n"
+                  r"\t+\}\n"
+              )
+              s, n = pattern.subn(r"\1\t\t\t\t\tblend.separate_alpha_blend = false;\n", s, count=1)
+              if n != 1:
+                  raise RuntimeError("96011cc production pattern not found")
+              p.write_text(s, encoding="utf-8")
           '@ | Set-Content -Encoding UTF8 .port_perf_tail.py
 
           python .port_perf_tail.py
