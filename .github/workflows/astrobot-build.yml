@@ -45,7 +45,19 @@ jobs:
           $perfCommits = git rev-list --reverse e317465d8a773b33482ad367ad2f856154c8bc6d..pr985
           foreach ($commit in $perfCommits) {
             git cherry-pick $commit
-            if ($LASTEXITCODE -ne 0) { throw "Cherry-pick #985 failed at $commit" }
+            if ($LASTEXITCODE -ne 0) {
+              $unmerged = @(git diff --name-only --diff-filter=U)
+              if ($unmerged.Count -gt 0 -and ($unmerged | Where-Object { $_ -ne "tests/shaderCfgTests.cpp" }).Count -eq 0) {
+                Write-Host "Resolving #985 test-only conflict using the PR version."
+                git checkout --theirs -- tests/shaderCfgTests.cpp
+                git add tests/shaderCfgTests.cpp
+                git -c core.editor=true cherry-pick --continue
+                if ($LASTEXITCODE -ne 0) { throw "Could not continue #985 cherry-pick at $commit" }
+              } else {
+                $unmerged | ForEach-Object { Write-Host "Unresolved: $_" }
+                throw "Cherry-pick #985 failed at $commit"
+              }
+            }
           }
 
           $markers = git grep -n -E '^(<<<<<<<|=======|>>>>>>>)' -- '*.cpp' '*.h' 2>$null
