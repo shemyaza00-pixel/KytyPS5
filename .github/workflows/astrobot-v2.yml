@@ -32,9 +32,6 @@ jobs:
           git fetch upstream refs/pull/985/head:pr985
           git fetch upstream refs/pull/988/head:pr988
           git fetch upstream e317465d8a773b33482ad367ad2f856154c8bc6d
-          git fetch upstream fcf0f3b67e3b92b2a89bea97fa0a1b85ebeff6e8
-          git fetch upstream a5b874e96e131b7926107b054e10b7464e8f321b
-          git fetch upstream d9f34f90caafe810e2caedde6a9ac9673a5b208d
 
           git cherry-pick pr838
           if ($LASTEXITCODE -ne 0) { throw "Cherry-pick #838 failed" }
@@ -66,32 +63,9 @@ jobs:
           # #848 shared AvPlayer audio-master clock. #966 is ported below because its
           # newer audio.cpp also contains unrelated controller changes.
 
-          # Astro-specific WQM/live-predicate correction.
-          git cherry-pick fcf0f3b67e3b92b2a89bea97fa0a1b85ebeff6e8
-          if ($LASTEXITCODE -ne 0) {
-            $unmerged = @(git diff --name-only --diff-filter=U)
-            if ($unmerged.Count -gt 0 -and ($unmerged | Where-Object { $_ -notlike "tests/*" }).Count -eq 0) {
-              foreach ($file in $unmerged) {
-                git checkout --theirs -- $file
-                git add $file
-              }
-              git -c core.editor=true cherry-pick --continue
-            }
-            if ($LASTEXITCODE -ne 0) { throw "#801 cherry-pick failed" }
-          }
-
-          # Two Astro rendering fixes from the dedicated rendering branch.
-          foreach ($commit in @(
-            "a5b874e96e131b7926107b054e10b7464e8f321b",
-            "d9f34f90caafe810e2caedde6a9ac9673a5b208d"
-          )) {
-            git cherry-pick $commit
-            if ($LASTEXITCODE -ne 0) {
-              $unmerged = @(git diff --name-only --diff-filter=U)
-              $unmerged | ForEach-Object { Write-Host "Unresolved renderer: $_" }
-              throw "Renderer cherry-pick failed at $commit"
-            }
-          }
+          # #985 already carries the relevant live-predicate/WQM machinery on this old base.
+          # The PR #558 DPP patch targets a different emitter architecture, so it is not
+          # cherry-picked here. The streamed-mip correction is ported explicitly below.
 
           # Recompiler disk cache (#988). Use the PR delta, resolving test-only conflicts from
           # the old #780 base in favour of the PR tests.
@@ -303,6 +277,262 @@ jobs:
           Remove-Item .port_audio966.py
           git diff --check
           if ($LASTEXITCODE -ne 0) { throw "#966 port has whitespace errors" }
+
+      - name: Port Astro streamed-mip residency fix
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+
+          def load(path):
+              return Path(path).read_text(encoding="utf-8")
+
+          def save(path, text):
+              Path(path).write_text(text, encoding="utf-8")
+
+          def repl(text, old, new, label):
+              if old not in text:
+                  raise RuntimeError(f"{label}: source text not found")
+              return text.replace(old, new, 1)
+
+          # Carry a first-resident mip in ImageInfo.
+          path = "src/graphics/host_gpu/renderer/image/imageInfo.h"
+          s = load(path)
+          if "resident_base_level" not in s:
+              s = repl(
+                  s,
+                  """\tImageSubresources            resources;
+          \tuint32_t                     pitch           = 0;""",
+                  """\tImageSubresources            resources;
+          \t// Finest mip level actually resident in guest memory for streamed textures.
+          \tuint32_t                     resident_base_level = 0;
+          \tuint32_t                     pitch           = 0;""",
+                  "image resident mip",
+              )
+              save(path, s)
+
+          # Teach tiled transfers to start at the first resident mip.
+          path = "src/graphics/host_gpu/renderer/image/textureCommon.h"
+          s = load(path)
+          s = repl(
+              s,
+              """bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferImageCopy>& regions,
+                                            const TextureUploadLayout& layout, uint32_t levels,
+                                            std::vector<GpuTileInfo>& out_tile_infos);""",
+              """bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferImageCopy>& regions,
+                                            const TextureUploadLayout& layout, uint32_t levels,
+                                            std::vector<GpuTileInfo>& out_tile_infos,
+                                            uint32_t base_level = 0);""",
+              "tile header",
+          )
+          save(path, s)
+
+          path = "src/graphics/host_gpu/renderer/image/textureCommon.cpp"
+          s = load(path)
+          s = repl(
+              s,
+              """bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferImageCopy>& regions,
+                                            const TextureUploadLayout& layout, uint32_t levels,
+                                            std::vector<GpuTileInfo>& out_tile_infos) {
+          \tconst auto& description    = layout.surface.description;
+          \tconst bool  volume_texture = description.dimension == TileSurfaceDimension::Dim3D;
+          \tconst auto  depth          = volume_texture ? description.depth : description.layers;
+          \tif (tiled_size == 0 || levels == 0 || levels > 16 || depth == 0 ||
+          \t    regions.size() != GetTextureRegionCount(depth, levels, volume_texture) ||
+          \t    Prospero::IsFmaskTextureFormat(description.format)) {""",
+              """bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferImageCopy>& regions,
+                                            const TextureUploadLayout& layout, uint32_t levels,
+                                            std::vector<GpuTileInfo>& out_tile_infos,
+                                            uint32_t base_level) {
+          \tconst auto& description    = layout.surface.description;
+          \tconst bool  volume_texture = description.dimension == TileSurfaceDimension::Dim3D;
+          \tconst auto  depth          = volume_texture ? description.depth : description.layers;
+          \tconst auto expected_regions = GetTextureRegionCount(depth, levels, volume_texture) -
+          \t                              GetTextureRegionCount(depth, base_level, volume_texture);
+          \tif (tiled_size == 0 || levels == 0 || levels > 16 || depth == 0 || base_level >= levels ||
+          \t    regions.size() != expected_regions ||
+          \t    Prospero::IsFmaskTextureFormat(description.format)) {""",
+              "tile implementation signature",
+          )
+          s = repl(
+              s,
+              "for (uint32_t mip_level = 0; mip_level < levels; ++mip_level) {",
+              "for (uint32_t mip_level = base_level; mip_level < levels; ++mip_level) {",
+              "tile mip loop",
+          )
+          save(path, s)
+
+          # Avoid uploading guest mips that belong to neighbouring streamed textures.
+          path = "src/graphics/host_gpu/renderer/cache/textureCache.cpp"
+          s = load(path)
+          s = repl(
+              s,
+              """\ttransfer.layout  = TextureCalcUploadLayout(format, info.extent.width, info.extent.height,
+          \t                                       info.resources.levels, layers, info.tile_mode,
+          \t                                       info.data.size, allow_depth_tile, volume, owner);
+          \ttransfer.regions = TextureBuildImageCopies(transfer.layout);
+          \tif (info.IsDepth()) {""",
+              """\ttransfer.layout  = TextureCalcUploadLayout(format, info.extent.width, info.extent.height,
+          \t                                       info.resources.levels, layers, info.tile_mode,
+          \t                                       info.data.size, allow_depth_tile, volume, owner);
+          \ttransfer.regions = TextureBuildImageCopies(transfer.layout);
+          \tconst auto tile_base =
+          \t    direction == TransferDirection::Upload ? info.resident_base_level : 0u;
+          \tif (tile_base != 0) {
+          \t\tstd::erase_if(transfer.regions, [tile_base](const vk::BufferImageCopy& region) {
+          \t\t\treturn region.imageSubresource.mipLevel < tile_base;
+          \t\t});
+          \t}
+          \tif (info.IsDepth()) {""",
+              "filter transfer mips",
+          )
+          s = repl(
+              s,
+              """\t\tif (!TextureBuildGpuTileInfos(info.data.size, transfer.regions, transfer.layout,
+          \t\t                              info.resources.levels, transfer.tiles)) {""",
+              """\t\tif (!TextureBuildGpuTileInfos(info.data.size, transfer.regions, transfer.layout,
+          \t\t                              info.resources.levels, transfer.tiles, tile_base)) {""",
+              "pass tile base",
+          )
+
+          # Heuristic fallback for BC7 streamed textures whose descriptors do not advertise MIN_LOD.
+          init_marker = "void TextureCache::InitializeImage(ImageId id) {"
+          if "FindResidentBaseLevel" not in s:
+              helper = r'''namespace {
+
+          [[nodiscard]] uint32_t FindResidentBaseLevel(const ImageInfo& info) {
+              constexpr uint32_t BlockBytes = 16;
+              constexpr uint32_t MaxSamples = 2048;
+              constexpr uint32_t UnwrittenPart = 8;
+              if ((info.guest_format != Prospero::BufferFormat::kBc7UNorm &&
+                   info.guest_format != Prospero::BufferFormat::kBc7Srgb) ||
+                  info.resources.levels <= 1 || info.data.Empty()) {
+                  return 0;
+              }
+              std::array<uint8_t, BlockBytes> block {};
+              uint32_t base = 0;
+              for (uint32_t level = 0; level + 1 < info.resources.levels; level++) {
+                  const auto& mip = info.mip_layout[level];
+                  if (mip.size < BlockBytes) {
+                      break;
+                  }
+                  const auto blocks = static_cast<uint32_t>(mip.size / BlockBytes);
+                  const auto step = std::max(1u, blocks / MaxSamples);
+                  uint32_t seen = 0;
+                  uint32_t empty = 0;
+                  for (uint32_t i = 0; i < blocks; i += step) {
+                      const auto at =
+                          info.data.address + mip.offset + static_cast<uint64_t>(i) * BlockBytes;
+                      if (!LibKernel::Memory::TryReadBacking(at, block.data(), 1)) {
+                          break;
+                      }
+                      seen++;
+                      if (block[0] == 0) {
+                          empty++;
+                      }
+                  }
+                  if (seen != 0 && empty * UnwrittenPart > seen) {
+                      base = level + 1;
+                  }
+              }
+              return base;
+          }
+
+          } // namespace
+
+          '''
+              if init_marker not in s:
+                  raise RuntimeError("InitializeImage marker not found")
+              s = s.replace(init_marker, helper + init_marker, 1)
+
+          s = repl(
+              s,
+              """\tif (image.info.samples > 1) {
+          \t\treturn;
+          \t}
+          \tconst bool upload = image.IsBufferModified() || image.IsCpuDirty();""",
+              """\tif (image.info.samples > 1) {
+          \t\treturn;
+          \t}
+          \tif (image.info.resident_base_level == 0) {
+          \t\timage.info.resident_base_level = FindResidentBaseLevel(image.info);
+          \t}
+          \tconst bool upload = image.IsBufferModified() || image.IsCpuDirty();""",
+              "initialize resident mip",
+          )
+          save(path, s)
+
+          # Clamp the Vulkan view and store the T# MIN_LOD residency hint.
+          path = "src/graphics/host_gpu/renderer/pipeline/descriptors.cpp"
+          s = load(path)
+          s = repl(
+              s,
+              """static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
+                                                   const ShaderTextureResource& descriptor, vk::Format format,
+                                                   const SurfaceFormatInfo& surface_format, bool storage,
+                                                   uint32_t view_levels, uint32_t image_layers) {
+          \tImageViewInfo view {};
+          \tview.format      = format;
+          \tview.aspect      = vk::ImageAspectFlagBits::eColor;
+          \tview.base_level  = descriptor.BaseLevel();
+          \tview.level_count = view_levels;""",
+              """static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
+                                                   const ShaderTextureResource& descriptor, vk::Format format,
+                                                   const SurfaceFormatInfo& surface_format, bool storage,
+                                                   uint32_t view_levels, uint32_t image_layers,
+                                                   uint32_t resident_base) {
+          \tImageViewInfo view {};
+          \tview.format = format;
+          \tview.aspect = vk::ImageAspectFlagBits::eColor;
+          \tconst auto first_level = std::max<uint32_t>(descriptor.BaseLevel(), resident_base);
+          \tview.base_level = first_level;
+          \tview.level_count =
+          \t    view_levels > (first_level - descriptor.BaseLevel())
+          \t        ? view_levels - (first_level - descriptor.BaseLevel())
+          \t        : 1u;""",
+              "texture view resident base",
+          )
+          s = repl(
+              s,
+              """\tconst auto base_lod = view.base_level * 256u;
+          \tif (descriptor.MinLod() > base_lod) {
+          \t\tview.min_lod = descriptor.MinLod() - base_lod;
+          \t}""",
+              """\tconst auto base_lod = view.base_level * 256u;
+          \tif (descriptor.MinLod() > base_lod) {
+          \t\tview.min_lod = descriptor.MinLod() - base_lod;
+          \t}""",
+              "keep min lod",
+          )
+          # Find the final ImageInfo assignments using a stable anchor near bytes_per_block.
+          anchor = """\tdesc.info.extent       = {width, height, volume ? depth : 1u};
+          \tdesc.info.resources    = {levels, image_layers};
+          \tdesc.info.pitch        = pitch;"""
+          if anchor not in s:
+              raise RuntimeError("descriptor info anchor not found")
+          s = s.replace(
+              anchor,
+              """\tdesc.info.extent       = {width, height, volume ? depth : 1u};
+          \tdesc.info.resources    = {levels, image_layers};
+          \tdesc.info.resident_base_level =
+          \t    multisampled ? 0u : std::min<uint32_t>(descriptor.MinLod() >> 8u, levels - 1u);
+          \tdesc.info.pitch        = pitch;""",
+              1,
+          )
+          old_call = """\tdesc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
+          \t                                 view_levels, desc.info.resources.layers);"""
+          new_call = """\tdesc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
+          \t                                 view_levels, desc.info.resources.layers,
+          \t                                 desc.info.resident_base_level);"""
+          s = repl(s, old_call, new_call, "texture view call")
+          save(path, s)
+          '@ | Set-Content -Encoding UTF8 .port_streamed_mips.py
+
+          python .port_streamed_mips.py
+          if ($LASTEXITCODE -ne 0) { throw "Failed to port streamed-mip fix" }
+          Remove-Item .port_streamed_mips.py
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw "Streamed-mip port has whitespace errors" }
 
       - name: Apply batching and persistent Vulkan cache
         shell: pwsh
