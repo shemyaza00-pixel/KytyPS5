@@ -100,65 +100,6 @@ jobs:
 
           git log -15 --oneline
 
-      - name: Port remaining low-risk performance fixes
-        shell: pwsh
-        run: |
-          @'
-          from pathlib import Path
-          import re
-
-          # 0ce84e5: limit a CPU-triggered GPU readback to the requested range instead
-          # of widening it to a 512 KiB window.
-          p = Path("src/graphics/host_gpu/renderer/cache/bufferCache.cpp")
-          s = p.read_text(encoding="utf-8")
-          if "DownloadBufferMemory<false>(buffer, vaddr, size)" not in s:
-              pattern = re.compile(
-                  r"\t\t// Widen nearby CPU reads so they share one GPU drain\.\n"
-                  r"\t\tconstexpr uint64_t WindowSize\s*= 512 \* 1024;\n"
-                  r"\t\tconst auto\s+buffer_begin = buffer\.CpuAddress\(\);\n"
-                  r"\t\tconst auto\s+buffer_end\s*= buffer_begin \+ buffer\.Size\(\);\n"
-                  r"\t\tconst auto window_begin = std::max\(Common::AlignDown\(vaddr, WindowSize\), buffer_begin\);\n"
-                  r"\t\tconst auto window_end = std::min\(std::max\(window_begin \+ WindowSize, vaddr \+ size\), buffer_end\);\n\n"
-                  r"\t\tif \(DownloadBufferMemory<false>\(buffer, window_begin, window_end - window_begin\)\) \{\n"
-                  r"\t\t\tm_memory_tracker\.UnmarkRegionAsGpuModified\(window_begin, window_end - window_begin\);\n"
-                  r"\t\t\}"
-              )
-              replacement = (
-                  "\t\tif (DownloadBufferMemory<false>(buffer, vaddr, size)) {\n"
-                  "\t\t\tm_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);\n"
-                  "\t\t}"
-              )
-              s, n = pattern.subn(replacement, s, count=1)
-              if n != 1:
-                  raise RuntimeError("0ce84e5 production pattern not found")
-              p.write_text(s, encoding="utf-8")
-
-          # 96011cc: equivalent separate-alpha state can reuse the broadcast-alpha
-          # shader/pipeline variant.
-          p = Path("src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp")
-          s = p.read_text(encoding="utf-8")
-          if "blend.separate_alpha_blend = false;" not in s:
-              pattern = re.compile(
-                  r"(\t+case ShaderAlphaBlendSource::SourceAlpha:\n"
-                  r"\t+blend\.color_srcblend\s*= RemapSourceAlphaFactor\(blend\.color_srcblend\);\n"
-                  r"\t+blend\.color_destblend = RemapSourceAlphaFactor\(blend\.color_destblend\);\n)"
-                  r"\t+if \(blend\.separate_alpha_blend\) \{\n"
-                  r"\t+blend\.alpha_srcblend\s*= RemapSourceAlphaFactor\(blend\.alpha_srcblend\);\n"
-                  r"\t+blend\.alpha_destblend = RemapSourceAlphaFactor\(blend\.alpha_destblend\);\n"
-                  r"\t+\}\n"
-              )
-              s, n = pattern.subn(r"\1\t\t\t\t\tblend.separate_alpha_blend = false;\n", s, count=1)
-              if n != 1:
-                  raise RuntimeError("96011cc production pattern not found")
-              p.write_text(s, encoding="utf-8")
-          '@ | Set-Content -Encoding UTF8 .port_perf_tail.py
-
-          python .port_perf_tail.py
-          if ($LASTEXITCODE -ne 0) { throw "Failed to port remaining performance fixes" }
-          Remove-Item .port_perf_tail.py
-          git diff --check
-          if ($LASTEXITCODE -ne 0) { throw "Performance port has whitespace errors" }
-
       - name: Port latest AudioOut clock fix (#966)
         shell: pwsh
         run: |
@@ -795,7 +736,7 @@ jobs:
           Adds official post-base audio timing/AvPlayer fixes (#822, #848, #966).
           #985 lineage includes #801 plus 64eea6b/684330c shader/render optimizations.
           Adds Astro streamed-mip residency and depth/colour target-size rendering fixes.
-          Adds 8fa116e, 0bb2bda, 0ce84e5 and 96011cc performance optimizations.
+          Adds 8fa116e and 0bb2bda performance optimizations; 0ce84e5/96011cc are deferred because their production ports diverge on this hybrid base.
           Keeps #900 interrupt-only RELEASE_MEM batching and #982 persistent Vulkan cache.
           The previous custom A/V frame-dropping experiment has been removed.
 
