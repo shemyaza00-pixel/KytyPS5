@@ -1,0 +1,364 @@
+name: Astro Bot Optimized V2 Windows build
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout known-working Astro base
+        uses: actions/checkout@v4
+        with:
+          repository: itsmemac/KytyPS5
+          ref: spiderman-running-22-09-2026
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Apply compatibility, audio, shader and cache fixes
+        shell: pwsh
+        run: |
+          git config user.name "AstroBot CI"
+          git config user.email "actions@users.noreply.github.com"
+          git remote add upstream https://github.com/KytyPS5/KytyPS5.git
+
+          git fetch upstream refs/pull/838/head:pr838
+          git fetch upstream 8c4224908b758abd91cf3a3f36fbe1be1b2f5e0a
+          git fetch upstream refs/pull/985/head:pr985
+          git fetch upstream refs/pull/988/head:pr988
+          git fetch upstream e317465d8a773b33482ad367ad2f856154c8bc6d
+          git fetch upstream 7855c980cb85cb916d47ad2e74ea14a311252e23
+          git fetch upstream e0b682e4b2cc08b127765333123aeeaa3d092fdb
+          git fetch upstream 70a475ec8cd08575a41b31d234578e9c3e672dfa
+          git fetch upstream fcf0f3b67e3b92b2a89bea97fa0a1b85ebeff6e8
+          git fetch upstream a5b874e96e131b7926107b054e10b7464e8f321b
+          git fetch upstream d9f34f90caafe810e2caedde6a9ac9673a5b208d
+
+          git cherry-pick pr838
+          if ($LASTEXITCODE -ne 0) { throw "Cherry-pick #838 failed" }
+
+          git cherry-pick 8c4224908b758abd91cf3a3f36fbe1be1b2f5e0a
+          if ($LASTEXITCODE -ne 0) { throw "Cherry-pick compatible #839 failed" }
+
+          # #985: known to require only test conflict resolution on this base.
+          $commits985 = git rev-list --reverse e317465d8a773b33482ad367ad2f856154c8bc6d..pr985
+          foreach ($commit in $commits985) {
+            git cherry-pick $commit
+            if ($LASTEXITCODE -ne 0) {
+              $unmerged = @(git diff --name-only --diff-filter=U)
+              if ($unmerged.Count -gt 0 -and ($unmerged | Where-Object { $_ -notlike "tests/*" }).Count -eq 0) {
+                foreach ($file in $unmerged) {
+                  git checkout --theirs -- $file
+                  git add $file
+                }
+                git -c core.editor=true cherry-pick --continue
+                if ($LASTEXITCODE -ne 0) { throw "Could not continue #985 at $commit" }
+              } else {
+                $unmerged | ForEach-Object { Write-Host "Unresolved: $_" }
+                throw "Cherry-pick #985 failed at $commit"
+              }
+            }
+          }
+
+          # Official post-base audio timing fixes.
+          foreach ($commit in @(
+            "7855c980cb85cb916d47ad2e74ea14a311252e23",
+            "e0b682e4b2cc08b127765333123aeeaa3d092fdb",
+            "70a475ec8cd08575a41b31d234578e9c3e672dfa"
+          )) {
+            git cherry-pick $commit
+            if ($LASTEXITCODE -ne 0) {
+              $unmerged = @(git diff --name-only --diff-filter=U)
+              $unmerged | ForEach-Object { Write-Host "Unresolved audio: $_" }
+              throw "Audio cherry-pick failed at $commit"
+            }
+          }
+
+          # Astro-specific WQM/live-predicate correction.
+          git cherry-pick fcf0f3b67e3b92b2a89bea97fa0a1b85ebeff6e8
+          if ($LASTEXITCODE -ne 0) {
+            $unmerged = @(git diff --name-only --diff-filter=U)
+            if ($unmerged.Count -gt 0 -and ($unmerged | Where-Object { $_ -notlike "tests/*" }).Count -eq 0) {
+              foreach ($file in $unmerged) {
+                git checkout --theirs -- $file
+                git add $file
+              }
+              git -c core.editor=true cherry-pick --continue
+            }
+            if ($LASTEXITCODE -ne 0) { throw "#801 cherry-pick failed" }
+          }
+
+          # Two Astro rendering fixes from the dedicated rendering branch.
+          foreach ($commit in @(
+            "a5b874e96e131b7926107b054e10b7464e8f321b",
+            "d9f34f90caafe810e2caedde6a9ac9673a5b208d"
+          )) {
+            git cherry-pick $commit
+            if ($LASTEXITCODE -ne 0) {
+              $unmerged = @(git diff --name-only --diff-filter=U)
+              $unmerged | ForEach-Object { Write-Host "Unresolved renderer: $_" }
+              throw "Renderer cherry-pick failed at $commit"
+            }
+          }
+
+          # Recompiler disk cache (#988). Use the PR delta, resolving test-only conflicts from
+          # the old #780 base in favour of the PR tests.
+          $commits988 = git rev-list --reverse e317465d8a773b33482ad367ad2f856154c8bc6d..pr988
+          foreach ($commit in $commits988) {
+            git cherry-pick $commit
+            if ($LASTEXITCODE -ne 0) {
+              $unmerged = @(git diff --name-only --diff-filter=U)
+              if ($unmerged.Count -gt 0 -and ($unmerged | Where-Object { $_ -notlike "tests/*" }).Count -eq 0) {
+                foreach ($file in $unmerged) {
+                  git checkout --theirs -- $file
+                  git add $file
+                }
+                git -c core.editor=true cherry-pick --continue
+              }
+              if ($LASTEXITCODE -ne 0) {
+                $unmerged | ForEach-Object { Write-Host "Unresolved #988: $_" }
+                throw "#988 cherry-pick failed at $commit"
+              }
+            }
+          }
+
+          $markers = git grep -n -E '^(<<<<<<<|=======|>>>>>>>)' -- '*.cpp' '*.h' 2>$null
+          if ($LASTEXITCODE -eq 0 -and $markers) {
+            $markers
+            throw "Conflict markers remain"
+          }
+
+          git log -15 --oneline
+
+      - name: Apply batching and persistent Vulkan cache
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+
+          def read(path):
+              return Path(path).read_text(encoding="utf-8")
+
+          def write(path, text):
+              Path(path).write_text(text, encoding="utf-8")
+
+          def replace_once(text, old, new, label):
+              if old not in text:
+                  raise RuntimeError(f"{label}: expected source text not found")
+              return text.replace(old, new, 1)
+
+          pm_path = "src/graphics/guest_gpu/command_processor/pm4Handlers.cpp"
+          pm = read(pm_path)
+          if "DeferInterruptOnlyReleaseMemFlushes" not in pm:
+              pm = replace_once(pm, "#include <cstdio>\n#include <cstring>",
+                                "#include <cstdio>\n#include <cstdlib>\n#include <cstring>", "#900 include")
+              pm = replace_once(pm, "namespace {\n\nconstexpr uint32_t GcrGl2MetadataInvalidate",
+          """namespace {
+
+          bool DeferInterruptOnlyReleaseMemFlushes() {
+              static const bool enabled = [] {
+                  const auto* value = std::getenv("KYTY_DEFER_RELEASE_MEM_INTERRUPTS");
+                  return value != nullptr && value[0] != '\\0' && std::strcmp(value, "0") != 0;
+              }();
+              return enabled;
+          }
+
+          constexpr uint32_t GcrGl2MetadataInvalidate""", "#900 helper")
+              pm = replace_once(pm,
+          """\t\t\tcase 0x01:
+          \t\t\tcase 0x02:
+          \t\t\tcase 0x04:
+          \t\t\t\tcp.TriggerEopEventAtEndOfPipe(interrupt_context_id);
+          \t\t\t\tcp.BufferFlush();
+          \t\t\t\tbreak;""",
+          """\t\t\tcase 0x01:
+          \t\t\tcase 0x02:
+          \t\t\tcase 0x04:
+          \t\t\t\tcp.TriggerEopEventAtEndOfPipe(interrupt_context_id);
+          \t\t\t\tif (!DeferInterruptOnlyReleaseMemFlushes()) {
+          \t\t\t\t\tcp.BufferFlush();
+          \t\t\t\t}
+          \t\t\t\tbreak;""", "#900 RELEASE_MEM")
+              write(pm_path, pm)
+
+          pc_path = "src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp"
+          pc = read(pc_path)
+          if "KytyPC2:" not in pc:
+              pc = pc.replace('#include "kytyGitVersion.h"\n', "", 1)
+              pc = replace_once(pc,
+                  "std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {",
+          """constexpr uint32_t kPipelineCacheFormat = 2;
+
+          std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {""", "#982 format")
+              pc = replace_once(pc,
+                  'return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\\n", KYTY_GIT_REVISION,\n\t                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);',
+                  'return fmt::format("KytyPC2:{}:{:08x}:{:08x}:{:08x}:{}\\n", kPipelineCacheFormat,\n\t                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);',
+                  "#982 signature")
+              old_gate = """\tconst std::string_view git_hash     = KYTY_GIT_HASH;
+          \tconst std::string_view git_revision = KYTY_GIT_REVISION;
+          \tif (git_hash == "unknown" || git_revision == "unknown") {
+          \t\tPipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
+          \t\treturn;
+          \t}
+          \tif (git_hash.ends_with("-dirty")) {
+          \t\tPipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
+          \t\treturn;
+          \t}
+
+          """
+              pc = pc.replace(old_gate, "", 1)
+              pc = pc.replace("Vulkan pipeline cache: invalidating {} (driver, emulator, or data mismatch)",
+                              "Vulkan pipeline cache: invalidating {} (driver, format, or data mismatch)", 1)
+              write(pc_path, pc)
+          '@ | Set-Content -Encoding UTF8 .astrobot_v2_patch.py
+
+          python .astrobot_v2_patch.py
+          if ($LASTEXITCODE -ne 0) { throw "Failed to apply #900/#982 runtime ports" }
+          Remove-Item .astrobot_v2_patch.py
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw "Patch whitespace errors" }
+
+      - name: Setup Visual Studio environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Locate vcpkg
+        id: vcpkg
+        shell: pwsh
+        run: |
+          $vcpkgRoot = Split-Path (Get-Command vcpkg).Source
+          "root=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Install glslang
+        shell: pwsh
+        run: |
+          vcpkg install glslang[tools,opt]:x64-windows
+          "${{ steps.vcpkg.outputs.root }}\installed\x64-windows\tools\glslang" |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install Qt 6.10.3
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.10.3"
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          cache: true
+
+      - name: Configure
+        shell: cmd
+        run: |
+          cmake -S . -B _Build\windows -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON ^
+            -DKYTY_BUILD_ORIGIN=Fork ^
+            -DKYTY_BUILD_REPOSITORY=shemyaza00-pixel/KytyPS5 ^
+            -DCMAKE_C_COMPILER=clang-cl ^
+            -DCMAKE_CXX_COMPILER=clang-cl ^
+            -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
+
+      - name: Build emulator and launcher
+        shell: cmd
+        run: |
+          cmake --build _Build\windows --target kyty_emulator launcher --parallel
+
+      - name: Install emulator and launcher
+        shell: cmd
+        run: |
+          cmake --install _Build\windows --prefix _Build\windows\install
+
+      - name: Add Astro Bot patch and launchers
+        shell: pwsh
+        run: |
+          $install = "_Build\windows\install"
+          New-Item -ItemType Directory -Force -Path "$install\_Patches" | Out-Null
+          @'
+          {
+            "id": "PPSA21564",
+            "name": "ASTRO BOT: non RT patch",
+            "version": "01.007.000",
+            "process": "eboot.bin",
+            "source_sha256": "70d673f7c43edb189461a60f076e15baa73f9a82a579603e44372ae5b7225d3d",
+            "mods": [
+              {
+                "name": "Select the existing non-tiled deferred-lighting renderer",
+                "enabled": true,
+                "memory": [
+                  {
+                    "offset": "0x73eb993",
+                    "off": "4584f60f84ed0800004531f64c8d3dea78a40141b430",
+                    "on": "4584f6e9ee080000904531f64c8d3dea78a40141b430"
+                  }
+                ]
+              },
+              {
+                "name": "Disable GI probes and lighting shaders",
+                "enabled": true,
+                "memory": [
+                  {
+                    "offset": "0x711d0b3",
+                    "off": "0fb682800700008887e4050000",
+                    "on": "b80000000090908887e4050000"
+                  }
+                ]
+              }
+            ]
+          }
+          '@ | Set-Content -Encoding UTF8 "$install\_Patches\PPSA21564.json"
+
+          @'
+          @echo off
+          cd /d "%~dp0"
+          set "KYTY_DEFER_RELEASE_MEM_INTERRUPTS=1"
+          kyty_emulator.exe --game "C:\Games\PS5 Games\PPSA21564-app" --game-patch "%~dp0_Patches\PPSA21564.json" --redzone --shader-optimization-type Performance
+          pause
+          '@ | Set-Content -Encoding ASCII "$install\RUN_ASTROBOT_V2.bat"
+
+          @'
+          @echo off
+          cd /d "%~dp0"
+          set "KYTY_DEFER_RELEASE_MEM_INTERRUPTS=0"
+          kyty_emulator.exe --game "C:\Games\PS5 Games\PPSA21564-app" --game-patch "%~dp0_Patches\PPSA21564.json" --redzone --shader-optimization-type Performance
+          pause
+          '@ | Set-Content -Encoding ASCII "$install\RUN_ASTROBOT_V2_NO_BATCHING.bat"
+
+          @'
+          @echo off
+          cd /d "%~dp0"
+          set "KYTY_DEFER_RELEASE_MEM_INTERRUPTS=1"
+          start "" launcher.exe
+          '@ | Set-Content -Encoding ASCII "$install\OPEN_LAUNCHER_V2.bat"
+
+          @'
+          Astro Bot Optimized V2 - PPSA21564 01.007.000
+
+          Keeps the known-working #780 + #838 + compatible #839 + #985 stack.
+          Adds official post-base audio timing/AvPlayer fixes (#822, #848, #966).
+          Adds #801 WQM/live-predicate correction.
+          Adds Astro rendering fixes for DPP helper lanes and streamed mip residency.
+          Adds #988 shader recompiler disk cache.
+          Keeps #900 interrupt-only RELEASE_MEM batching and #982 persistent Vulkan cache.
+          The previous custom A/V frame-dropping experiment has been removed.
+
+          Recommended: RUN_ASTROBOT_V2.bat
+          Comparison without #900: RUN_ASTROBOT_V2_NO_BATCHING.bat
+          GUI with #900 environment: OPEN_LAUNCHER_V2.bat
+          '@ | Set-Content -Encoding UTF8 "$install\README-ASTROBOT-V2.txt"
+
+      - name: Verify package
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse "_Build\windows\install"
+          if (!(Test-Path "_Build\windows\install\kyty_emulator.exe")) { throw "kyty_emulator.exe missing" }
+          if (!(Test-Path "_Build\windows\install\launcher.exe")) { throw "launcher.exe missing" }
+
+      - name: Upload V2 build
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-AstroBot-Optimized-V2-Windows-x64
+          path: _Build/windows/install/**
+          if-no-files-found: error
