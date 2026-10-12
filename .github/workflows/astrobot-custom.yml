@@ -1,0 +1,156 @@
+name: Astro Bot custom Windows build
+
+on:
+  push:
+    branches: [ astrobot-custom-build ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout PR 780 branch
+        uses: actions/checkout@v4
+        with:
+          repository: itsmemac/KytyPS5
+          ref: spiderman-running-22-09-2026
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Apply Astro Bot fixes (#838 and #839)
+        shell: pwsh
+        run: |
+          git config user.name "AstroBot CI"
+          git config user.email "actions@users.noreply.github.com"
+          git remote add upstream https://github.com/KytyPS5/KytyPS5.git
+          git fetch upstream refs/pull/838/head:pr838
+          git fetch upstream 8c4224908b758abd91cf3a3f36fbe1be1b2f5e0a
+
+          git cherry-pick pr838
+          if ($LASTEXITCODE -ne 0) { throw "Cherry-pick #838 failed" }
+
+          # Use the pre-merge #839 revision that was explicitly tested on top of #780.
+          git cherry-pick 8c4224908b758abd91cf3a3f36fbe1be1b2f5e0a
+          if ($LASTEXITCODE -ne 0) { throw "Cherry-pick tested #839 revision failed" }
+
+          $markers = git grep -n -E '^(<<<<<<<|=======|>>>>>>>)' -- '*.cpp' '*.h' 2>$null
+          if ($LASTEXITCODE -eq 0 -and $markers) {
+            $markers
+            throw "Conflict markers remain after applying fixes"
+          }
+
+          git log -5 --oneline
+
+      - name: Setup Visual Studio environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Locate vcpkg
+        id: vcpkg
+        shell: pwsh
+        run: |
+          $vcpkgRoot = Split-Path (Get-Command vcpkg).Source
+          "root=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Install glslang
+        shell: pwsh
+        run: |
+          vcpkg install glslang[tools,opt]:x64-windows
+          "${{ steps.vcpkg.outputs.root }}\installed\x64-windows\tools\glslang" |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Configure
+        shell: cmd
+        run: |
+          cmake -S . -B _Build\windows -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON ^
+            -DKYTY_BUILD_LAUNCHER=OFF ^
+            -DKYTY_BUILD_ORIGIN=Fork ^
+            -DKYTY_BUILD_REPOSITORY=shemyaza00-pixel/KytyPS5 ^
+            -DCMAKE_C_COMPILER=clang-cl ^
+            -DCMAKE_CXX_COMPILER=clang-cl
+
+      - name: Build emulator
+        shell: cmd
+        run: |
+          cmake --build _Build\windows --target kyty_emulator --parallel
+
+      - name: Install emulator
+        shell: cmd
+        run: |
+          cmake --install _Build\windows --prefix _Build\windows\install
+
+      - name: Add Astro Bot patch and launcher
+        shell: pwsh
+        run: |
+          $install = "_Build\windows\install"
+          New-Item -ItemType Directory -Force -Path "$install\_Patches" | Out-Null
+          @'
+          {
+            "id": "PPSA21564",
+            "name": "ASTRO BOT: non RT patch",
+            "version": "01.007.000",
+            "process": "eboot.bin",
+            "source_sha256": "70d673f7c43edb189461a60f076e15baa73f9a82a579603e44372ae5b7225d3d",
+            "mods": [
+              {
+                "name": "Select the existing non-tiled deferred-lighting renderer",
+                "enabled": true,
+                "memory": [
+                  {
+                    "offset": "0x73eb993",
+                    "off": "4584f60f84ed0800004531f64c8d3dea78a40141b430",
+                    "on": "4584f6e9ee080000904531f64c8d3dea78a40141b430"
+                  }
+                ]
+              },
+              {
+                "name": "Disable GI probes and lighting shaders",
+                "enabled": true,
+                "memory": [
+                  {
+                    "offset": "0x711d0b3",
+                    "off": "0fb682800700008887e4050000",
+                    "on": "b80000000090908887e4050000"
+                  }
+                ]
+              }
+            ]
+          }
+          '@ | Set-Content -Encoding UTF8 "$install\_Patches\PPSA21564.json"
+
+          @'
+          @echo off
+          cd /d "%~dp0"
+          kyty_emulator.exe --game "C:\Games\PS5 Games\PPSA21564-app" --game-patch "%~dp0_Patches\PPSA21564.json" --redzone
+          pause
+          '@ | Set-Content -Encoding ASCII "$install\RUN_ASTROBOT.bat"
+
+          @'
+          Custom Astro Bot build for PPSA21564 01.007.000.
+
+          Base: PR #780 (itsmemac/spiderman-running-22-09-2026)
+          Added: PR #838 (protected-page file-read fix / infinite loading tunnel)
+          Added: PR #839 (native EXTRQ trampoline for Intel CPUs)
+          Bundled: Astro Bot non-RT patch
+          Launch: RUN_ASTROBOT.bat
+
+          Expected game path:
+          C:\Games\PS5 Games\PPSA21564-app
+          '@ | Set-Content -Encoding UTF8 "$install\README-ASTROBOT.txt"
+
+      - name: Verify package
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse "_Build\windows\install"
+          if (!(Test-Path "_Build\windows\install\kyty_emulator.exe")) { throw "kyty_emulator.exe missing" }
+
+      - name: Upload custom build
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-AstroBot-Windows-x64
+          path: _Build/windows/install/**
+          if-no-files-found: error
