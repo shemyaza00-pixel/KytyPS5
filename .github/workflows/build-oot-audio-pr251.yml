@@ -1,4 +1,4 @@
-name: OoT movie audio fix - Lichii 117 and Fritchii v4
+name: OoT movie audio fix - Lichii 117 and Fritchii v4.1
 
 on:
   push:
@@ -24,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(github.event_name == 'push' && '[{"label":"Fritchii-v4-PR251","upstream":"Frizti/Fritchii","version":"fritchii-v4"}]' || '[{"label":"Lichii-117-PR251","upstream":"zortos293/Lichii","version":"build-117"},{"label":"Fritchii-v4-PR251","upstream":"Frizti/Fritchii","version":"fritchii-v4"}]') }}
+        include: ${{ fromJSON(github.event_name == 'push' && '[{"label":"Fritchii-v4.1-PR251","upstream":"Frizti/Fritchii","version":"fritchii-v4.1"}]' || '[{"label":"Lichii-117-PR251","upstream":"zortos293/Lichii","version":"build-117"},{"label":"Fritchii-v4.1-PR251","upstream":"Frizti/Fritchii","version":"fritchii-v4.1"}]') }}
 
     steps:
       - name: Fetch exact emulator version
