@@ -2,6 +2,11 @@ name: OoT movie audio fix - Lichii 117 and Fritchii v4
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - oot-audio-pr251-build/**
 
 permissions:
   contents: read
@@ -92,6 +97,9 @@ jobs:
         working-directory: emulator
         shell: pwsh
         run: |
+          # MSVC strict shadow warnings in both upstream tags are unrelated to PR251.
+          # _CL_ is appended after target /we4458 /we4459 by cl.exe.
+          $env:_CL_ = '/wd4458 /wd4459'
           cmake --build build/release --target yuzu yuzu-cmd --parallel 2
           if ($LASTEXITCODE -ne 0) { throw 'Compilation failed' }
 
