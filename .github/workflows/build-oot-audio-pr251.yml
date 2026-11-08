@@ -1,6 +1,11 @@
 name: OoT movie audio fix - Lichii 117 and Fritchii v4
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/build-oot-audio-pr251.yml
   workflow_dispatch:
   pull_request:
     branches:
@@ -19,13 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - label: Lichii-117-PR251
-            upstream: zortos293/Lichii
-            version: build-117
-          - label: Fritchii-v4-PR251
-            upstream: Frizti/Fritchii
-            version: fritchii-v4
+        include: ${{ fromJSON(github.event_name == 'push' && '[{"label":"Fritchii-v4-PR251","upstream":"Frizti/Fritchii","version":"fritchii-v4"}]' || '[{"label":"Lichii-117-PR251","upstream":"zortos293/Lichii","version":"build-117"},{"label":"Fritchii-v4-PR251","upstream":"Frizti/Fritchii","version":"fritchii-v4"}]') }}
 
     steps:
       - name: Fetch exact emulator version
@@ -98,8 +97,8 @@ jobs:
         shell: pwsh
         run: |
           # MSVC strict shadow warnings in both upstream tags are unrelated to PR251.
-          # Suppress only C4457/C4458/C4459, which target source treats as errors.
-          $env:_CL_ = '/wd4457 /wd4458 /wd4459'
+          # Suppress C4456..C4459 shadowing warnings in upstream source, unrelated to PR251.
+          $env:_CL_ = '/wd4456 /wd4457 /wd4458 /wd4459'
           cmake --build build/release --target yuzu yuzu-cmd --parallel 2
           if ($LASTEXITCODE -ne 0) { throw 'Compilation failed' }
 
