@@ -64,6 +64,24 @@ jobs:
           git diff --check
           if ($LASTEXITCODE -ne 0) { throw 'Windows Clang compatibility patch is malformed' }
 
+      - name: Fix upstream Clang shadow warning in Vulkan compute dispatch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = 'src/video_core/renderer_vulkan/vk_rasterizer.cpp'
+          $text = [System.IO.File]::ReadAllText((Resolve-Path $source))
+          $before = 'if (const auto device = gpu_memory->GpuToCpuAddress(*indirect)) {'
+          $after = 'if (const auto mapped_cpu_addr = gpu_memory->GpuToCpuAddress(*indirect)) {'
+          if (!$text.Contains($before) -or !$text.Contains('split.RecordDispatchWrite(*device, 12);')) {
+            throw 'Unexpected rasterizer source while fixing Clang shadow warning'
+          }
+          $text = $text.Replace($before, $after)
+          $text = $text.Replace('split.RecordDispatchWrite(*device, 12);',
+                                'split.RecordDispatchWrite(*mapped_cpu_addr, 12);')
+          [System.IO.File]::WriteAllText((Resolve-Path $source), $text)
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'Source patch failed diff check' }
+
       - name: Verify Fritchii PGO training profile
         shell: pwsh
         run: |
