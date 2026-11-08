@@ -130,7 +130,7 @@ jobs:
         shell: pwsh
         working-directory: emulator
         run: |
-          $env:_CL_ = '/wd4456 /wd4457 /wd4458 /wd4459'
+          # clang-cl compiles with native MSVC ABI but does not accept MSVC /wd flags via _CL_.
           cmake --build build/release --target yuzu --parallel 2
           if ($LASTEXITCODE -ne 0) { throw 'Clang MSVC-ABI build failed' }
 
