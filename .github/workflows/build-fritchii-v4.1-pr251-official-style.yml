@@ -1,0 +1,166 @@
+name: Fritchii v4.1 official-style Clang PGO ThinLTO + PR251 movie-only
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/build-fritchii-v4.1-pr251-official-style.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Fritchii 4.1 official-style Clang 23 PGO ThinLTO + minimal PR251
+    runs-on: windows-2022
+    timeout-minutes: 360
+    steps:
+      - name: Check out patch script
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check out exact official Fritchii 4.1 source
+        uses: actions/checkout@v4
+        with:
+          repository: Frizti/Fritchii
+          ref: f6d42b87150678e001dbeb84679a9595935ce951
+          path: emulator
+          persist-credentials: false
+
+      - name: Patch only cutscene frame synchronization from PR251
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python oot-build/apply_pr251_video_only.py emulator
+          if ($LASTEXITCODE -ne 0) { throw 'Minimal patch failed' }
+          git -C emulator diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'Patch has whitespace errors' }
+          $files = @(git -C emulator diff --name-only)
+          if ($files.Count -ne 1 -or $files[0] -ne 'src/core/hle/service/nx2_gsv.h') {
+            throw "Patch touched unexpected files: $($files -join ', ')"
+          }
+          Write-Output 'Verified: exactly one source file changed, only decoder movie clock logic.'
+
+      - name: Initialize Visual Studio 2022 runtime and SDK
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install MSVC Qt 6.8.3 (same DLL family as official ZIP)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qtcharts
+          cache: true
+
+      - name: Install upstream Vulkan SDK
+        shell: pwsh
+        working-directory: emulator
+        run: |
+          ./tools/windows/install-vulkan-sdk.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Vulkan SDK setup failed' }
+
+      - name: Install official LLVM clang-cl 23.1.5 (Windows MSVC ABI)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $url = 'https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.5/clang%2Bllvm-23.1.5-x86_64-pc-windows-msvc.tar.zst'
+          $archive = Join-Path $env:RUNNER_TEMP 'llvm23.tar.zst'
+          $dest = Join-Path $env:RUNNER_TEMP 'llvm23'
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          $actual = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expected = 'b2be33385ddc86e83511417a060de927ae8b09d1f3017cc3cdce5c73cd5029d7'
+          if ($actual -ne $expected) { throw "LLVM official archive SHA256 mismatch: $actual" }
+          & 7z.exe x $archive "-o$dest" -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot expand LLVM zstd archive' }
+          $tar = Get-ChildItem $dest -Filter '*.tar' -File -Recurse | Select-Object -First 1
+          if (!$tar) { throw 'LLVM archive did not produce a .tar file' }
+          & 7z.exe x $tar.FullName "-o$dest" -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot extract LLVM tar' }
+          $clang = Get-ChildItem $dest -Recurse -Filter 'clang-cl.exe' -File | Select-Object -First 1
+          if (!$clang) { throw 'LLVM package missing clang-cl.exe' }
+          $lld = Join-Path $clang.DirectoryName 'lld-link.exe'
+          if (!(Test-Path $lld)) { throw 'LLVM package missing lld-link.exe' }
+          "LLVM23_BIN=$($clang.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $clang.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & $clang.FullName --version
+          Write-Output 'Using MSVC-targeting LLVM 23.1.5, not MinGW.'
+
+      - name: Configure Clang PGO and ThinLTO Release
+        shell: pwsh
+        working-directory: emulator
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $clang = (Join-Path $env:LLVM23_BIN 'clang-cl.exe').Replace('\','/')
+          $lld = (Join-Path $env:LLVM23_BIN 'lld-link.exe').Replace('\','/')
+          $profile = (Resolve-Path 'eglantine.profdata').Path.Replace('\','/')
+          if ((Get-Item 'eglantine.profdata').Length -lt 1000000) { throw 'Missing PGO profile' }
+          $flags = "-fprofile-use=$profile -flto=thin -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date"
+          cmake -S . -B build/release -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            "-DCMAKE_C_COMPILER=$clang" `
+            "-DCMAKE_CXX_COMPILER=$clang" `
+            "-DCMAKE_LINKER=$lld" `
+            "-DCMAKE_C_FLAGS=$flags" `
+            "-DCMAKE_CXX_FLAGS=$flags" `
+            "-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld" `
+            "-DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld" `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL `
+            -DBUILD_TESTING=OFF `
+            -DYUZU_TESTS=OFF `
+            -DYUZU_CMD=OFF `
+            -DYUZU_ROOM=OFF `
+            -DYUZU_ROOM_STANDALONE=OFF `
+            -DYUZU_USE_BUNDLED_QT=OFF `
+            -DYUZU_USE_BUNDLED_SDL3=ON `
+            -DENABLE_UPDATE_CHECKER=OFF `
+            -DUSE_DISCORD_PRESENCE=OFF `
+            "-DLICHII_BUILD_TAG=Fritchii-v4.1-PR251-minimal" `
+            "-DLICHII_BUILD_PLATFORM=windows-x86_64"
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
+          Write-Output 'CMake config: clang-cl 23.1.5 + native MSVC libraries + PGO + ThinLTO.'
+
+      - name: Compile minimal PR251 build
+        shell: pwsh
+        working-directory: emulator
+        run: |
+          $env:_CL_ = '/wd4456 /wd4457 /wd4458 /wd4459'
+          cmake --build build/release --target yuzu --parallel 2
+          if ($LASTEXITCODE -ne 0) { throw 'Clang MSVC-ABI build failed' }
+
+      - name: Package like the official VC-runtime Windows distribution
+        shell: pwsh
+        working-directory: emulator
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = 'build/release/bin'
+          if (!(Test-Path "$dir/lichii.exe")) { throw 'Emulator EXE missing' }
+          windeployqt --release --no-translations "$dir/lichii.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Qt packaging failed' }
+          $dlls = @(Get-ChildItem $dir -File -Filter '*.dll' | Select-Object -ExpandProperty Name)
+          $mingw = @($dlls | Where-Object { $_ -match '^(libgcc|libstdc|libwinpthread|libiconv|libicu)' })
+          if ($mingw.Count -gt 0) { throw "Unexpected MinGW DLL dependencies: $($mingw -join ', ')" }
+          $buildInfo = @'
+          Fritchii 4.1 (exact official source commit f6d42b87150678e001dbeb84679a9595935ce951)
+          Added ONLY Lichii PR251 cutscene movie frame sync logic in src/core/hle/service/nx2_gsv.h.
+          No PR251 audio hooks or diagnostics, no renderer/kernel/gameplay changes.
+          Windows x64 Clang-cl 23.1.5, MSVC ABI/CRT, PGO via eglantine.profdata, ThinLTO.
+          Release packaging via MSVC Qt 6.8.3 windeployqt; no MinGW DLLs.
+          This is a reconstruction, not a byte-identical copy of the official executable.
+          '@
+          $buildInfo | Set-Content -Encoding UTF8 "$dir/BUILD-INFO-PR251-MINIMAL.txt"
+          Get-ChildItem $dir -File | Select-Object Name,Length | Format-Table
+
+      - name: Upload Windows x64 executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: Fritchii-v4.1-PR251-MINIMAL-Clang23-MSVCABI-PGO-ThinLTO
+          path: emulator/build/release/bin/
+          if-no-files-found: error
+          retention-days: 14
