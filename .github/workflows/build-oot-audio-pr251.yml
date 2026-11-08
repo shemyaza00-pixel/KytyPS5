@@ -1,0 +1,120 @@
+name: OoT movie audio fix - Lichii 117 and Fritchii v4
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: ${{ matrix.label }}
+    runs-on: windows-2022
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Lichii-117-PR251
+            upstream: zortos293/Lichii
+            version: build-117
+          - label: Fritchii-v4-PR251
+            upstream: Frizti/Fritchii
+            version: fritchii-v4
+
+    steps:
+      - name: Fetch exact emulator version
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.upstream }}
+          ref: ${{ matrix.version }}
+          path: emulator
+          persist-credentials: false
+
+      - name: Apply OoT video/audio synchronization patch PR 251
+        working-directory: emulator
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $patch = Join-Path $env:RUNNER_TEMP 'oot-movie-clock-pr251.diff'
+          Invoke-WebRequest -Uri 'https://github.com/zortos293/Lichii/pull/251.diff' -OutFile $patch
+          if (!(Test-Path $patch)) { throw 'Patch download failed' }
+          git apply --check $patch
+          if ($LASTEXITCODE -ne 0) { throw 'Patch not compatible with this source revision' }
+          git apply $patch
+          if ($LASTEXITCODE -ne 0) { throw 'git apply failed' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'Patch diff check failed' }
+          if (!(Select-String -Path 'src/core/hle/service/nx2_gsv.h' -Pattern 'OcarinaOfTimeMovieProgramId' -Quiet)) {
+            throw 'OoT sync fix marker is missing after patch'
+          }
+          Write-Output 'OoT PR251 applied successfully to ${{ matrix.upstream }} @ ${{ matrix.version }}'
+
+      - name: Configure Visual Studio build environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Qt 6.8.3
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qtcharts
+          cache: true
+
+      - name: Install Vulkan SDK
+        working-directory: emulator
+        shell: pwsh
+        run: ./tools/windows/install-vulkan-sdk.ps1
+
+      - name: Configure CMake Release
+        working-directory: emulator
+        shell: pwsh
+        run: |
+          cmake -S . -B build/release -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DBUILD_TESTING=OFF `
+            -DYUZU_TESTS=OFF `
+            -DYUZU_CMD=ON `
+            -DYUZU_ROOM=OFF `
+            -DYUZU_ROOM_STANDALONE=OFF `
+            -DYUZU_USE_BUNDLED_QT=OFF `
+            -DYUZU_USE_BUNDLED_SDL3=ON `
+            -DENABLE_UPDATE_CHECKER=OFF `
+            -DUSE_DISCORD_PRESENCE=OFF `
+            '-DLICHII_BUILD_TAG=PR251-OOT-AUDIO' `
+            '-DLICHII_BUILD_PLATFORM=windows-x86_64'
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
+
+      - name: Build Windows executable
+        working-directory: emulator
+        shell: pwsh
+        run: |
+          cmake --build build/release --target yuzu yuzu-cmd --parallel 2
+          if ($LASTEXITCODE -ne 0) { throw 'Compilation failed' }
+
+      - name: Bundle Qt DLLs and describe build
+        working-directory: emulator
+        shell: pwsh
+        run: |
+          $dir = 'build/release/bin'
+          if (!(Test-Path "$dir/lichii.exe")) { throw 'lichii.exe missing' }
+          windeployqt --release --no-translations "$dir/lichii.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'windeployqt failed' }
+          @'
+          Custom experimental Windows x64 MSVC Release build (no PGO)
+          Base: ${{ matrix.upstream }} tag ${{ matrix.version }}
+          Added patch: https://github.com/zortos293/Lichii/pull/251
+          Fix targets OoT pre-rendered video/audio timing when below 60 fps.
+          Not an official upstream build; test and keep backups.
+          '@ | Set-Content -Encoding UTF8 "$dir/PR251-BUILD-INFO.txt"
+
+      - name: Upload downloadable ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}-Windows-x64
+          path: emulator/build/release/bin/
+          if-no-files-found: error
+          retention-days: 14
