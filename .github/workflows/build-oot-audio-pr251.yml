@@ -7,6 +7,12 @@ on:
     paths:
       - .github/workflows/build-oot-audio-pr251.yml
       - oot-audio-pr251-build/**
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .github/workflows/build-oot-audio-pr251.yml
+      - oot-audio-pr251-build/**
   workflow_dispatch:
 
 permissions:
