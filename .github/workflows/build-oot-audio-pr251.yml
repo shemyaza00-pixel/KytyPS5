@@ -6,6 +6,7 @@ on:
       - build-oot-audio-pr251
     paths:
       - .github/workflows/build-oot-audio-pr251.yml
+      - oot-audio-pr251-build/**
   workflow_dispatch:
 
 permissions:
