@@ -45,6 +45,25 @@ jobs:
             throw 'PR251 signature absent'
           }
 
+      - name: Fix upstream Windows Clang compatibility (DWM linker directive)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = 'src/video_core/renderer_vulkan/vk_host_pacer.cpp'
+          $text = [System.IO.File]::ReadAllText((Resolve-Path $source))
+          $original = '#pragma comment(lib, "dwmapi.lib")'
+          if (!$text.Contains($original)) { throw 'Expected MSVC-only pragma not found' }
+          $replacement = "#ifdef _MSC_VER`n#pragma comment(lib, `"dwmapi.lib`")`n#endif"
+          $text = $text.Replace($original, $replacement)
+          [System.IO.File]::WriteAllText((Resolve-Path $source), $text)
+
+          $cmake = 'src/video_core/CMakeLists.txt'
+          $cmakeText = [System.IO.File]::ReadAllText((Resolve-Path $cmake))
+          $cmakeText += "`n# Required by vk_host_pacer.cpp under MinGW Clang (MSVC uses pragma comment).`nif(MINGW)`n    target_link_libraries(video_core PRIVATE dwmapi)`nendif()`n"
+          [System.IO.File]::WriteAllText((Resolve-Path $cmake), $cmakeText)
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'Windows Clang compatibility patch is malformed' }
+
       - name: Verify Fritchii PGO training profile
         shell: pwsh
         run: |
