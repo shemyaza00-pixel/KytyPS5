@@ -98,8 +98,8 @@ jobs:
         shell: pwsh
         run: |
           # MSVC strict shadow warnings in both upstream tags are unrelated to PR251.
-          # _CL_ is appended after target /we4458 /we4459 by cl.exe.
-          $env:_CL_ = '/wd4458 /wd4459'
+          # Suppress only C4457/C4458/C4459, which target source treats as errors.
+          $env:_CL_ = '/wd4457 /wd4458 /wd4459'
           cmake --build build/release --target yuzu yuzu-cmd --parallel 2
           if ($LASTEXITCODE -ne 0) { throw 'Compilation failed' }
 
